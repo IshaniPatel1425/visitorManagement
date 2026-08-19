@@ -18,6 +18,13 @@ export default defineConfig({
         ws: true,
         changeOrigin: true,
         secure: false,
+      },
+      // Face Recognition server (face_server.py on port 5001)
+      '/face': {
+        target: 'http://localhost:5001',
+        changeOrigin: true,
+        secure: false,
+        rewrite: (path) => path.replace(/^\/face/, ''),
       }
     }
   }

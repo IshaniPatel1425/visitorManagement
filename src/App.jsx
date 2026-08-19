@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
 export default function App() {
-  const [currentView, setCurrentView] = useState('landing'); // 'landing', 'guard', 'resident', 'camera'
+  const [currentView, setCurrentView] = useState('landing'); // 'landing', 'guard', 'resident', 'camera', 'face'
   
   return (
     <>
@@ -21,6 +21,10 @@ export default function App() {
           <button onClick={() => setCurrentView('resident')} className={currentView === 'resident' ? 'active' : ''}>
             <i className="fa-solid fa-house-user"></i> Resident Portal
           </button>
+          <button onClick={() => setCurrentView('face')} className={currentView === 'face' ? 'active' : ''}
+            style={currentView === 'face' ? { borderColor: 'rgba(168,85,247,0.5)', color: '#c084fc' } : {}}>
+            <i className="fa-solid fa-eye"></i> Face Recognition
+          </button>
         </div>
       </nav>
 
@@ -29,6 +33,7 @@ export default function App() {
         {currentView === 'guard' && <GuardDashboard />}
         {currentView === 'resident' && <ResidentPortal />}
         {currentView === 'camera' && <MobileCamera />}
+        {currentView === 'face' && <FaceRecognition />}
       </main>
 
       <footer className="footer">
@@ -64,6 +69,12 @@ function LandingView({ onViewChange }) {
           <i className="fa-solid fa-house-user"></i>
           <h2>Resident Portal</h2>
           <p>Log in as a resident to upload family profile photos, register vehicle plate numbers, and view complete entry timestamps of your vehicles.</p>
+        </div>
+
+        <div onClick={() => onViewChange('face')} className="portal-card face-card glass-panel">
+          <i className="fa-solid fa-eye"></i>
+          <h2>Face Recognition</h2>
+          <p>Live webcam face detection and recognition powered by OpenCV YuNet + SFace. Register visitors by photo or webcam snapshot and verify identities in real-time.</p>
         </div>
       </div>
 
@@ -999,6 +1010,289 @@ function MobileCamera() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── FACE RECOGNITION COMPONENT ───────────────────────────────────────────────
+function FaceRecognition() {
+  const [status, setStatus] = useState({ detector: false, recognizer: false, camera: false, db_count: 0 });
+  const [faceDb, setFaceDb] = useState({});
+  const [detections, setDetections] = useState([]);
+  const [regTab, setRegTab] = useState('upload');
+  const [uploadName, setUploadName] = useState('');
+  const [webcamName, setWebcamName] = useState('');
+  const [photoFile, setPhotoFile] = useState(null);
+  const [previewSrc, setPreviewSrc] = useState(null);
+  const [uploadMsg, setUploadMsg] = useState(null);
+  const [webcamMsg, setWebcamMsg] = useState(null);
+  const [logs, setLogs] = useState([{ cls: 'face-log-info', text: 'System started — awaiting activity.' }]);
+  const [streamKey, setStreamKey] = useState(Date.now());
+  const logBoxRef = useRef(null);
+
+  const addLog = (cls, text) =>
+    setLogs(prev => [...prev.slice(-80), { cls, text: `[${new Date().toLocaleTimeString()}] ${text}` }]);
+
+  // Auto-scroll log
+  useEffect(() => {
+    if (logBoxRef.current) logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+  }, [logs]);
+
+  // Poll status
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        const r = await fetch('/face/api/status');
+        const d = await r.json();
+        setStatus(d);
+      } catch (_) {}
+    };
+    fetchStatus();
+    const id = setInterval(fetchStatus, 4000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Poll face DB
+  const refreshDb = async () => {
+    try {
+      const r = await fetch('/face/api/db');
+      const d = await r.json();
+      setFaceDb(d);
+    } catch (_) {}
+  };
+  useEffect(() => {
+    refreshDb();
+    const id = setInterval(refreshDb, 8000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Poll detections
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const r = await fetch('/face/api/detections');
+        const d = await r.json();
+        setDetections(d.faces || []);
+        (d.faces || []).forEach(f => {
+          if (f.name !== 'Unknown')
+            addLog('face-log-ok', `Verified: ${f.name} (${(f.score * 100).toFixed(1)}% confidence)`);
+        });
+      } catch (_) {}
+    };
+    const id = setInterval(poll, 1500);
+    return () => clearInterval(id);
+  }, []);
+
+  // Register from photo upload
+  const handleUpload = async () => {
+    if (!uploadName.trim()) { setUploadMsg({ text: '⚠ Please enter a name.', ok: false }); return; }
+    if (!photoFile)         { setUploadMsg({ text: '⚠ Please choose a photo.', ok: false }); return; }
+    addLog('face-log-info', `Registering "${uploadName}" from uploaded photo…`);
+    const fd = new FormData();
+    fd.append('name', uploadName.trim());
+    fd.append('photo', photoFile);
+    try {
+      const r = await fetch('/face/register_photo', { method: 'POST', body: fd });
+      const d = await r.json();
+      setUploadMsg({ text: d.success ? `✅ ${d.message}` : `❌ ${d.message}`, ok: d.success });
+      if (d.success) { addLog('face-log-ok', d.message); refreshDb(); }
+      else             addLog('face-log-danger', d.message);
+    } catch (e) { setUploadMsg({ text: '❌ Network error', ok: false }); }
+  };
+
+  // Register from webcam snapshot
+  const handleWebcam = async () => {
+    if (!webcamName.trim()) { setWebcamMsg({ text: '⚠ Please enter a name.', ok: false }); return; }
+    addLog('face-log-info', `Capturing webcam frames for "${webcamName}"…`);
+    try {
+      const r = await fetch('/face/register_webcam', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: webcamName.trim() })
+      });
+      const d = await r.json();
+      setWebcamMsg({ text: d.success ? `✅ ${d.message}` : `❌ ${d.message}`, ok: d.success });
+      if (d.success) { addLog('face-log-ok', d.message); refreshDb(); }
+      else             addLog('face-log-danger', d.message);
+    } catch (e) { setWebcamMsg({ text: '❌ Network error', ok: false }); }
+  };
+
+  // Delete a registered person
+  const handleDelete = async (name) => {
+    if (!window.confirm(`Delete all embeddings for "${name}"? This cannot be undone.`)) return;
+    try {
+      const r = await fetch(`/face/delete_face/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (d.success) { addLog('face-log-warn', `Deleted face: ${name}`); refreshDb(); }
+      else             addLog('face-log-danger', `Delete failed: ${d.message}`);
+    } catch (e) { addLog('face-log-danger', `Delete error: ${e}`); }
+  };
+
+  const allOk = status.detector && status.recognizer && status.camera;
+
+  return (
+    <div className="face-layout">
+
+      {/* ── LEFT: Live Feed ── */}
+      <div className="face-panel">
+        <div className="face-panel-title">Live Webcam — Face Detection &amp; Recognition</div>
+
+        <div className="face-video-wrap">
+          <img
+            key={streamKey}
+            src="/face/video_feed"
+            alt="Live face stream"
+            onError={() => setTimeout(() => setStreamKey(Date.now()), 3000)}
+          />
+          <div className={`face-live-badge ${allOk ? 'live' : 'warn'}`}>
+            <span className="face-pulse"></span>
+            {allOk ? 'LIVE — face recognition active' : 'LIVE — limited mode'}
+          </div>
+        </div>
+
+        {/* Detected chips */}
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.5px', marginBottom: 8 }}>
+            Detected Faces (real-time)
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, minHeight: 32 }}>
+            {detections.length === 0
+              ? <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>No face in frame</span>
+              : detections.map((f, i) => (
+                <div key={i} className={`face-chip ${f.name !== 'Unknown' ? 'known' : 'unknown'}`}>
+                  {f.name !== 'Unknown' ? '✔' : '?'} {f.name}
+                  <span style={{ opacity: .6, fontWeight: 400 }}>{(f.score * 100).toFixed(0)}%</span>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      </div>
+
+      {/* ── RIGHT: Controls ── */}
+      <div className="face-right-col">
+
+        {/* System Status */}
+        <div className="face-panel">
+          <div className="face-panel-title">System Status</div>
+          <div className="face-diag-grid">
+            <div className="face-diag-box">
+              <span className="face-diag-label">Face Detector</span>
+              <span className={`face-diag-val ${status.detector ? 'ok' : 'warn'}`}>
+                {status.detector ? '✔ YuNet (ONNX)' : '✘ Model missing'}
+              </span>
+            </div>
+            <div className="face-diag-box">
+              <span className="face-diag-label">Face Recognizer</span>
+              <span className={`face-diag-val ${status.recognizer ? 'ok' : 'warn'}`}>
+                {status.recognizer ? '✔ SFace (ONNX)' : '✘ Model missing'}
+              </span>
+            </div>
+            <div className="face-diag-box">
+              <span className="face-diag-label">Webcam</span>
+              <span className={`face-diag-val ${status.camera ? 'ok' : 'warn'}`}>
+                {status.camera ? '✔ Active' : '✘ Not found'}
+              </span>
+            </div>
+            <div className="face-diag-box">
+              <span className="face-diag-label">Registered</span>
+              <span className="face-diag-val ok">{status.db_count} people</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Register New Face */}
+        <div className="face-panel">
+          <div className="face-panel-title">Register New Face</div>
+          <div className="face-reg-tabs">
+            <button className={`face-reg-tab ${regTab === 'upload' ? 'active' : ''}`} onClick={() => setRegTab('upload')}>
+              📁 Upload Photo
+            </button>
+            <button className={`face-reg-tab ${regTab === 'webcam' ? 'active' : ''}`} onClick={() => setRegTab('webcam')}>
+              📷 Webcam Snapshot
+            </button>
+          </div>
+
+          {regTab === 'upload' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div>
+                <label className="face-label">Full Name</label>
+                <input className="face-input" placeholder="e.g. Tanvi Patel" value={uploadName}
+                  onChange={e => setUploadName(e.target.value)} />
+              </div>
+              <div>
+                <label className="face-label">Face Photo (clear, well-lit)</label>
+                <input className="face-input" type="file" accept="image/*"
+                  onChange={e => {
+                    const f = e.target.files[0];
+                    setPhotoFile(f || null);
+                    setPreviewSrc(f ? URL.createObjectURL(f) : null);
+                  }} />
+                {previewSrc && <img src={previewSrc} alt="preview" className="face-preview-img" style={{ display: 'block' }} />}
+              </div>
+              <button className="face-btn face-btn-primary" onClick={handleUpload}>
+                <i className="fa-solid fa-user-plus"></i> Register from Photo
+              </button>
+              {uploadMsg && (
+                <div className={`face-toast ${uploadMsg.ok ? 'ok' : 'err'}`} style={{ display: 'block' }}>
+                  {uploadMsg.text}
+                </div>
+              )}
+            </div>
+          )}
+
+          {regTab === 'webcam' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div>
+                <label className="face-label">Full Name</label>
+                <input className="face-input" placeholder="e.g. Tanvi Patel" value={webcamName}
+                  onChange={e => setWebcamName(e.target.value)} />
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                Look directly at the webcam, then click the button. The system captures 5 frames and builds an average embedding.
+              </p>
+              <button className="face-btn face-btn-primary" onClick={handleWebcam}>
+                <i className="fa-solid fa-camera"></i> Capture &amp; Register
+              </button>
+              {webcamMsg && (
+                <div className={`face-toast ${webcamMsg.ok ? 'ok' : 'err'}`} style={{ display: 'block' }}>
+                  {webcamMsg.text}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Registered Faces DB */}
+        <div className="face-panel">
+          <div className="face-panel-title">Registered Faces Database</div>
+          <div className="face-db-list">
+            {Object.keys(faceDb).length === 0
+              ? <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>No faces registered yet.</span>
+              : Object.entries(faceDb).map(([name, cnt]) => (
+                <div key={name} className="face-db-item">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span className="face-db-name">{name}</span>
+                    <span className="face-db-count">{cnt} embed{cnt !== 1 ? 's' : ''}</span>
+                  </div>
+                  <button className="face-del-btn" title={`Delete ${name}`} onClick={() => handleDelete(name)}>🗑</button>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+
+        {/* Activity Log */}
+        <div className="face-panel">
+          <div className="face-panel-title">Activity Log</div>
+          <div className="face-log-box" ref={logBoxRef}>
+            {logs.map((l, i) => (
+              <div key={i} className={`face-log-line ${l.cls}`}>{l.text}</div>
+            ))}
+          </div>
+        </div>
+
+      </div>{/* /right-col */}
     </div>
   );
 }
