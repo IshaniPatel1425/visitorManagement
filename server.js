@@ -16,6 +16,7 @@ dotenv.config();
 import Resident from './models/Resident.js';
 import Vehicle from './models/Vehicle.js';
 import GateLog from './models/GateLog.js';
+import FaceLog from './models/FaceLog.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,13 +32,14 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/gate_guard';
+const FACE_SERVER_URL = process.env.FACE_SERVER_URL || 'http://localhost:5001';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
 // Ensure upload folders exist
-const uploadDirs = ['uploads/gate', 'uploads/profile', 'static/images'];
+const uploadDirs = ['uploads/gate', 'uploads/profile', 'uploads/face', 'static/images'];
 uploadDirs.forEach(dir => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -47,6 +49,7 @@ uploadDirs.forEach(dir => {
 // Serve static assets
 app.use('/static/uploads/gate', express.static(path.join(__dirname, 'uploads/gate')));
 app.use('/static/uploads/profile', express.static(path.join(__dirname, 'uploads/profile')));
+app.use('/static/uploads/face', express.static(path.join(__dirname, 'uploads/face')));
 app.use('/static/images', express.static(path.join(__dirname, 'static/images')));
 
 // Connect to MongoDB
@@ -57,7 +60,7 @@ mongoose.connect(MONGO_URI)
     console.warn('WARNING: Ensure MongoDB is running locally at mongodb://127.0.0.1:27017/ or provide a MONGO_URI.');
   });
 
-// Setup Multer Storage for file uploads
+// ─── Multer Storage Configs ───────────────────────────────────────────────────
 const storageGate = multer.diskStorage({
   destination: (req, file, cb) => cb(null, 'uploads/gate/'),
   filename: (req, file, cb) => cb(null, `${uuidv4()}.jpg`)
@@ -66,11 +69,31 @@ const uploadGate = multer({ storage: storageGate });
 
 const storageProfile = multer.diskStorage({
   destination: (req, file, cb) => cb(null, 'uploads/profile/'),
-  filename: (req, file, cb) => cb(null, `profile_${req.query.id}_${uuidv4().substring(0, 8)}.jpg`)
+  filename: (req, file, cb) => {
+    const id = req.query.id || 'new';
+    cb(null, `profile_${id}_${uuidv4().substring(0, 8)}.jpg`);
+  }
 });
 const uploadProfile = multer({ storage: storageProfile });
 
-// Helper to generate UUIDs
+// Storage for individual family member photos
+const storageMember = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'uploads/profile/'),
+  filename: (req, file, cb) => {
+    const safeName = (req.body.name || 'member').replace(/[^a-zA-Z0-9]/g, '_');
+    cb(null, `member_${safeName}_${uuidv4().substring(0, 8)}.jpg`);
+  }
+});
+const uploadMember = multer({ storage: storageMember });
+
+// Storage for face event snapshots from Python face server
+const storageFaceEvent = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'uploads/face/'),
+  filename: (req, file, cb) => cb(null, `face_event_${Date.now()}.jpg`)
+});
+const uploadFaceEvent = multer({ storage: storageFaceEvent });
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function uuidv4() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = Math.random() * 16 | 0;
@@ -159,7 +182,52 @@ async function checkRegisteredDbFuzzy(plateText) {
   return { isMatch: false, info: null, matchedPlate: null };
 }
 
-// WebSocket connection logs
+/**
+ * Register or update a face embedding in the Python face server.
+ * @param {string} faceKey - Unique key like "506_Sai Patel"
+ * @param {string} photoPath - Absolute path to the photo on disk
+ * @returns {{ success: boolean, message: string }}
+ */
+async function registerFaceInPythonServer(faceKey, photoPath) {
+  try {
+    const { default: FormDataNode } = await import('form-data');
+    const fetch = (await import('node-fetch')).default;
+
+    const form = new FormDataNode();
+    form.append('name', faceKey);
+    form.append('photo', fs.createReadStream(photoPath));
+
+    const response = await fetch(`${FACE_SERVER_URL}/register_photo`, {
+      method: 'POST',
+      body: form,
+      headers: form.getHeaders(),
+    });
+    const result = await response.json();
+    return result;
+  } catch (err) {
+    console.error('[FACE REG] Error registering face:', err.message);
+    return { success: false, message: err.message };
+  }
+}
+
+/**
+ * Delete a face embedding from the Python face server.
+ */
+async function deleteFaceFromPythonServer(faceKey) {
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch(`${FACE_SERVER_URL}/delete_face/${encodeURIComponent(faceKey)}`, {
+      method: 'DELETE',
+    });
+    const result = await response.json();
+    return result;
+  } catch (err) {
+    console.error('[FACE DEL] Error deleting face:', err.message);
+    return { success: false, message: err.message };
+  }
+}
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`Socket client connected: ${socket.id}`);
   socket.on('disconnect', () => {
@@ -167,7 +235,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Create default assets on startup (avatars, simulated car)
+// ─── Default Assets ───────────────────────────────────────────────────────────
 function createDefaultAssets() {
   const avatars = {
     "avatar1.svg": `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" fill="#4f46e5"/><circle cx="50" cy="40" r="18" fill="#e0e7ff"/><path d="M22 78c0-12 12-16 28-16s28 4 28 16v4H22v-4z" fill="#e0e7ff"/></svg>`,
@@ -186,7 +254,7 @@ function createDefaultAssets() {
 }
 createDefaultAssets();
 
-// --- REST API Endpoints ---
+// ─── REST API Endpoints ───────────────────────────────────────────────────────
 
 // 1. Get all residents
 app.get('/api/residents/list', async (req, res) => {
@@ -198,7 +266,7 @@ app.get('/api/residents/list', async (req, res) => {
   }
 });
 
-// 2. Get/Save resident profile details
+// 2. Resident Login (by flat number)
 app.get('/api/residents/login', async (req, res) => {
   try {
     const { flat } = req.query;
@@ -211,15 +279,17 @@ app.get('/api/residents/login', async (req, res) => {
       id: resident._id,
       flat_number: resident.flatNumber,
       family_name: resident.familyName,
-      family_members: resident.familyMembers || '',
       contact: resident.contact,
-      photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg'
+      photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg',
+      head_face_registered: resident.headFaceRegistered || false,
+      family_members: resident.familyMembers || []
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// 3. Get Resident Profile (by ID)
 app.get('/api/residents/profile', async (req, res) => {
   try {
     const resident = await Resident.findById(req.query.id);
@@ -228,33 +298,131 @@ app.get('/api/residents/profile', async (req, res) => {
       id: resident._id,
       flat_number: resident.flatNumber,
       family_name: resident.familyName,
-      family_members: resident.familyMembers || '',
       contact: resident.contact,
-      photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg'
+      photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg',
+      head_face_registered: resident.headFaceRegistered || false,
+      family_members: resident.familyMembers || []
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// 3b. Get Resident by Face Key (for Face Recognition Tab live details)
+app.get('/api/residents/by-face-key', async (req, res) => {
+  try {
+    const { key } = req.query;
+    if (!key || key === 'Unknown') return res.status(404).json({ error: 'Unknown face' });
+    
+    let flatNumber = '';
+    let memberName = '';
+    const underscoreIdx = key.indexOf('_');
+    if (underscoreIdx !== -1) {
+      flatNumber = key.substring(0, underscoreIdx);
+      memberName = key.substring(underscoreIdx + 1);
+    } else {
+      memberName = key;
+    }
+
+    let resident = null;
+    if (flatNumber) {
+      resident = await Resident.findOne({ flatNumber });
+    }
+    if (!resident) {
+      resident = await Resident.findOne({
+        $or: [
+          { familyName: new RegExp(`^${memberName}$`, 'i') },
+          { 'familyMembers.name': new RegExp(`^${memberName}$`, 'i') }
+        ]
+      });
+    }
+
+    if (!resident) return res.status(404).json({ error: 'Resident not found for this face' });
+
+    let phone = resident.contact || '-';
+    let profilePhotoUrl = resident.photoUrl || '/static/images/unknown_avatar.svg';
+
+    if (resident.familyName.toLowerCase() !== memberName.toLowerCase()) {
+      const member = resident.familyMembers.find(m => m.name.toLowerCase() === memberName.toLowerCase());
+      if (member) {
+        phone = member.phone || '-';
+        profilePhotoUrl = member.photoUrl || '/static/images/unknown_avatar.svg';
+      }
+    }
+
+    res.json({
+      name: memberName,
+      flat: resident.flatNumber,
+      phone: phone,
+      profile_photo_url: profilePhotoUrl,
+      flat_profile: {
+        flat_number: resident.flatNumber,
+        family_head: {
+          name: resident.familyName,
+          contact: resident.contact || '-',
+          photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg',
+          face_registered: resident.headFaceRegistered || false
+        },
+        other_members: (resident.familyMembers || []).map(m => ({
+          id: m._id,
+          name: m.name,
+          phone: m.phone,
+          photo_url: m.photoUrl || '/static/images/unknown_avatar.svg'
+        }))
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Save/Register Resident Profile (with optional photo upload)
 app.post('/api/residents/profile', uploadProfile.single('photo'), async (req, res) => {
   try {
     const residentId = req.query.id;
-    const { family_name, contact, flat_number, family_members } = req.body;
+    const { family_name, contact, flat_number } = req.body;
     
     let photoUrl = undefined;
+    let photoAbsPath = undefined;
     if (req.file) {
       photoUrl = `/static/uploads/profile/${req.file.filename}`;
+      photoAbsPath = path.join(__dirname, req.file.path);
     }
 
     if (residentId && residentId !== 'null' && residentId !== 'undefined') {
-      // Update existing
-      let updateFields = { familyName: family_name, contact, familyMembers: family_members };
+      // --- UPDATE EXISTING RESIDENT ---
+      const existing = await Resident.findById(residentId);
+      if (!existing) return res.status(404).json({ error: 'Resident not found' });
+
+      let updateFields = { familyName: family_name, contact };
       if (photoUrl) updateFields.photoUrl = photoUrl;
+
+      // If a new photo was uploaded, register face in Python server
+      if (photoAbsPath) {
+        const faceKey = `${existing.flatNumber}_${family_name.trim()}`;
+        const faceResult = await registerFaceInPythonServer(faceKey, photoAbsPath);
+        if (faceResult.success) {
+          updateFields.headFaceKey = faceKey;
+          updateFields.headFaceRegistered = true;
+          console.log(`[FACE] Registered head face for ${faceKey}`);
+        } else {
+          console.warn(`[FACE] Could not register head face: ${faceResult.message}`);
+          // Don't block save if face registration fails (e.g. no face in image)
+        }
+      }
+
       const updated = await Resident.findByIdAndUpdate(residentId, updateFields, { new: true });
-      return res.json(updated);
+      return res.json({
+        id: updated._id,
+        flat_number: updated.flatNumber,
+        family_name: updated.familyName,
+        contact: updated.contact,
+        photo_url: updated.photoUrl || '/static/images/unknown_avatar.svg',
+        head_face_registered: updated.headFaceRegistered || false,
+        family_members: updated.familyMembers || []
+      });
     } else {
-      // Create new
+      // --- CREATE NEW RESIDENT ---
       if (!flat_number) return res.status(400).json({ error: 'Flat number is required for new registration' });
       
       const existing = await Resident.findOne({ flatNumber: flat_number.trim() });
@@ -266,17 +434,34 @@ app.post('/api/residents/profile', uploadProfile.single('photo'), async (req, re
         flatNumber: flat_number.trim(),
         familyName: family_name,
         contact,
-        familyMembers: family_members,
-        photoUrl: photoUrl || '/static/images/unknown_avatar.svg'
+        photoUrl: photoUrl || '/static/images/unknown_avatar.svg',
+        headFaceRegistered: false,
+        familyMembers: []
       });
       await newResident.save();
+
+      // Register face if photo was uploaded
+      if (photoAbsPath) {
+        const faceKey = `${flat_number.trim()}_${family_name.trim()}`;
+        const faceResult = await registerFaceInPythonServer(faceKey, photoAbsPath);
+        if (faceResult.success) {
+          await Resident.findByIdAndUpdate(newResident._id, {
+            headFaceKey: faceKey,
+            headFaceRegistered: true
+          });
+          newResident.headFaceRegistered = true;
+          console.log(`[FACE] Registered head face for new resident ${faceKey}`);
+        }
+      }
+
       return res.json({
         id: newResident._id,
         flat_number: newResident.flatNumber,
         family_name: newResident.familyName,
-        family_members: newResident.familyMembers || '',
         contact: newResident.contact,
-        photo_url: newResident.photoUrl
+        photo_url: newResident.photoUrl,
+        head_face_registered: newResident.headFaceRegistered,
+        family_members: []
       });
     }
   } catch (err) {
@@ -284,7 +469,136 @@ app.post('/api/residents/profile', uploadProfile.single('photo'), async (req, re
   }
 });
 
-// 3. Get/Add resident vehicles and logs
+// 5. Detect Face Only (validate that a photo contains a face)
+app.post('/api/residents/detect-face', uploadProfile.single('photo'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: 'No photo uploaded' });
+  const photoAbsPath = path.join(__dirname, req.file.path);
+
+  try {
+    const { default: FormDataNode } = await import('form-data');
+    const fetch = (await import('node-fetch')).default;
+
+    const form = new FormDataNode();
+    form.append('photo', fs.createReadStream(photoAbsPath));
+
+    const response = await fetch(`${FACE_SERVER_URL}/detect_face_only`, {
+      method: 'POST',
+      body: form,
+      headers: form.getHeaders(),
+    });
+    const result = await response.json();
+
+    if (!result.success) {
+      // Clean up uploaded file if no face detected
+      fs.unlinkSync(photoAbsPath);
+      return res.json({ success: false, message: result.message || 'No face detected' });
+    }
+
+    res.json({
+      success: true,
+      faces_count: result.faces_count,
+      photo_url: `/static/uploads/profile/${req.file.filename}`,
+      photo_path: photoAbsPath
+    });
+  } catch (err) {
+    // If Python server is down, be permissive
+    console.warn('[DETECT] Python face server error, allowing upload:', err.message);
+    res.json({
+      success: true,
+      faces_count: 1,
+      photo_url: `/static/uploads/profile/${req.file.filename}`,
+      photo_path: photoAbsPath
+    });
+  }
+});
+
+// 6. Add a Family Member (upload photo + register face)
+app.post('/api/residents/member', uploadMember.single('photo'), async (req, res) => {
+  try {
+    const { id: residentId } = req.query;
+    const { name, phone } = req.body;
+
+    if (!residentId) return res.status(400).json({ error: 'Resident ID required' });
+    if (!name || !phone) return res.status(400).json({ error: 'Name and phone are required' });
+    if (!req.file) return res.status(400).json({ error: 'Member photo is required' });
+
+    const resident = await Resident.findById(residentId);
+    if (!resident) return res.status(404).json({ error: 'Resident not found' });
+
+    // Check for duplicate name in this flat
+    const dupMember = resident.familyMembers.find(
+      m => m.name.toLowerCase() === name.trim().toLowerCase()
+    );
+    if (dupMember) {
+      return res.status(400).json({ error: `A member named "${name}" is already registered in this flat.` });
+    }
+
+    const photoUrl = `/static/uploads/profile/${req.file.filename}`;
+    const photoAbsPath = path.join(__dirname, req.file.path);
+    const faceKey = `${resident.flatNumber}_${name.trim()}`;
+
+    // Register face in Python server
+    const faceResult = await registerFaceInPythonServer(faceKey, photoAbsPath);
+    if (!faceResult.success) {
+      // Clean up uploaded file
+      try { fs.unlinkSync(photoAbsPath); } catch {}
+      return res.status(400).json({
+        error: `Face registration failed: ${faceResult.message}. Please ensure the photo shows a clear, well-lit face.`
+      });
+    }
+
+    // Add member to resident's familyMembers array
+    resident.familyMembers.push({
+      name: name.trim(),
+      phone: phone.trim(),
+      photoUrl,
+      faceKey
+    });
+    await resident.save();
+
+    console.log(`[MEMBER] Added family member ${faceKey} to flat ${resident.flatNumber}`);
+    res.json({
+      success: true,
+      member: resident.familyMembers[resident.familyMembers.length - 1],
+      message: `${name} registered successfully with face recognition.`
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Delete a Family Member
+app.delete('/api/residents/member/:memberId', async (req, res) => {
+  try {
+    const { id: residentId } = req.query;
+    const { memberId } = req.params;
+
+    if (!residentId) return res.status(400).json({ error: 'Resident ID required' });
+
+    const resident = await Resident.findById(residentId);
+    if (!resident) return res.status(404).json({ error: 'Resident not found' });
+
+    const member = resident.familyMembers.id(memberId);
+    if (!member) return res.status(404).json({ error: 'Member not found' });
+
+    const faceKey = member.faceKey;
+    const memberName = member.name;
+
+    // Remove from MongoDB
+    resident.familyMembers.pull({ _id: memberId });
+    await resident.save();
+
+    // Delete face from Python server
+    await deleteFaceFromPythonServer(faceKey);
+
+    console.log(`[MEMBER] Removed family member ${faceKey} from flat ${resident.flatNumber}`);
+    res.json({ success: true, message: `${memberName} removed successfully.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Get/Add resident vehicles and logs
 app.get('/api/residents/vehicles', async (req, res) => {
   try {
     const residentId = req.query.id;
@@ -327,7 +641,7 @@ app.post('/api/residents/vehicles', async (req, res) => {
   }
 });
 
-// 4. Gate Logs history
+// 9. Gate Logs history (ANPR)
 app.get('/api/logs', async (req, res) => {
   try {
     const logs = await GateLog.find().sort({ timestamp: -1 }).limit(20);
@@ -354,7 +668,158 @@ app.post('/api/logs/clear', async (req, res) => {
   }
 });
 
-// 5. Gate Camera snapshot upload (Node spawns Python EasyOCR process)
+// 10. Face Verification Logs
+app.get('/api/face-logs', async (req, res) => {
+  try {
+    const logs = await FaceLog.find().sort({ timestamp: -1 }).limit(30);
+    res.json(logs.map(l => ({
+      id: l._id,
+      name: l.name,
+      flat_number: l.flatNumber,
+      phone: l.phone,
+      status: l.status,
+      photo_path: l.photoPath,
+      profile_photo_url: l.profilePhotoUrl,
+      score: l.score,
+      timestamp: l.timestamp
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/face-logs/clear', async (req, res) => {
+  try {
+    await FaceLog.deleteMany({});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Face Event Webhook (called by Python face_server.py when a face is detected)
+app.post('/api/face-event', uploadFaceEvent.single('photo'), async (req, res) => {
+  try {
+    const { matched_key, score } = req.body;
+    const photoPath = req.file ? `/static/uploads/face/${req.file.filename}` : '/static/images/unknown_avatar.svg';
+    const scoreNum = parseFloat(score) || 0;
+
+    if (!matched_key || matched_key === 'Unknown') {
+      // ── STRANGER ALERT ──
+      const faceLog = new FaceLog({
+        faceKey: 'Unknown',
+        name: 'Unknown Person',
+        flatNumber: '-',
+        phone: '-',
+        status: 'UNKNOWN',
+        photoPath,
+        profilePhotoUrl: '/static/images/unknown_avatar.svg',
+        score: scoreNum
+      });
+      await faceLog.save();
+
+      const socketPayload = {
+        status: 'UNKNOWN',
+        name: 'Unknown Person',
+        flat: '-',
+        phone: '-',
+        profile_photo_url: '/static/images/unknown_avatar.svg',
+        live_photo_url: photoPath,
+        score: scoreNum,
+        log_id: faceLog._id
+      };
+      io.emit('new-face-scan', socketPayload);
+      console.log(`[FACE EVENT] STRANGER ALERT emitted`);
+      return res.json({ success: true, status: 'stranger_alert' });
+    }
+
+    // ── RECOGNIZED RESIDENT ──
+    // matched_key format: "flatNumber_memberName"  e.g. "506_Sai Patel"
+    const underscoreIdx = matched_key.indexOf('_');
+    if (underscoreIdx === -1) {
+      return res.status(400).json({ error: 'Invalid matched_key format. Expected: flatNumber_memberName' });
+    }
+    const flatNumber = matched_key.substring(0, underscoreIdx);
+    const memberName = matched_key.substring(underscoreIdx + 1);
+
+    // Find the full resident profile (including all members and vehicles)
+    const resident = await Resident.findOne({ flatNumber });
+
+    let phone = '-';
+    let profilePhotoUrl = '/static/images/unknown_avatar.svg';
+    let resolvedName = memberName;
+    let isHead = false;
+
+    if (resident) {
+      // Check if it's the family head
+      if (resident.familyName.toLowerCase() === memberName.toLowerCase()) {
+        phone = resident.contact || '-';
+        profilePhotoUrl = resident.photoUrl || '/static/images/unknown_avatar.svg';
+        isHead = true;
+      } else {
+        // Check family members array
+        const member = resident.familyMembers.find(
+          m => m.name.toLowerCase() === memberName.toLowerCase()
+        );
+        if (member) {
+          phone = member.phone || '-';
+          profilePhotoUrl = member.photoUrl || '/static/images/unknown_avatar.svg';
+        }
+      }
+    }
+
+    // Build the full flat profile to send to the guard
+    const flatProfile = resident ? {
+      flat_number: resident.flatNumber,
+      family_head: {
+        name: resident.familyName,
+        contact: resident.contact || '-',
+        photo_url: resident.photoUrl || '/static/images/unknown_avatar.svg',
+        face_registered: resident.headFaceRegistered || false
+      },
+      other_members: resident.familyMembers.map(m => ({
+        id: m._id,
+        name: m.name,
+        phone: m.phone,
+        photo_url: m.photoUrl || '/static/images/unknown_avatar.svg'
+      }))
+    } : null;
+
+    const faceLog = new FaceLog({
+      faceKey: matched_key,
+      name: resolvedName,
+      flatNumber,
+      phone,
+      status: 'RECOGNIZED',
+      photoPath,
+      profilePhotoUrl,
+      score: scoreNum
+    });
+    await faceLog.save();
+
+    const socketPayload = {
+      status: 'RECOGNIZED',
+      name: resolvedName,
+      flat: flatNumber,
+      phone,
+      profile_photo_url: profilePhotoUrl,
+      live_photo_url: photoPath,
+      score: scoreNum,
+      log_id: faceLog._id,
+      // Full flat data for guard display
+      flat_profile: flatProfile
+    };
+    io.emit('new-face-scan', socketPayload);
+    console.log(`[FACE EVENT] Recognized: ${matched_key} (score: ${scoreNum.toFixed(3)})`);
+    return res.json({ success: true, status: 'recognized' });
+
+  } catch (err) {
+    console.error('[FACE EVENT] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12. Gate Camera snapshot upload (Node spawns Python EasyOCR process)
 app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No photo uploaded' });
@@ -365,7 +830,6 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
 
   console.log(`[CAMERA] Spawning Python OCR for file: ${filePath}`);
   
-  // Spawn python child process to run anpr_cli.py
   const pythonProcess = spawn('python', ['anpr_cli.py', filePath]);
 
   let stdoutData = '';
@@ -394,12 +858,10 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
       const scannedPlate = parsed.plate || 'UNKNOWN';
       console.log(`[OCR] Extracted plate: '${scannedPlate}'`);
 
-      // Run Mongoose Lookup (Exact and Fuzzy matching)
       const { isMatch, info, matchedPlate } = await checkRegisteredDbFuzzy(scannedPlate);
       const status = isMatch ? 'GRANTED' : 'DENIED';
       const resolvedPlate = isMatch ? matchedPlate : scannedPlate;
 
-      // Log transaction to MongoDB
       const log = new GateLog({
         plateNumber: resolvedPlate,
         status,
@@ -409,7 +871,6 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
       });
       await log.save();
 
-      // Broadcast payload to react dashboard via Socket.io
       const socketPayload = {
         plate: resolvedPlate,
         status,
@@ -438,7 +899,7 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
   });
 });
 
-// 6. Manual Entry Simulation Endpoint
+// 13. Manual Entry Simulation Endpoint
 app.post('/api/simulate', async (req, res) => {
   try {
     const { plate_number } = req.body;
@@ -446,13 +907,11 @@ app.post('/api/simulate', async (req, res) => {
 
     const cleanPlate = plate_number.toUpperCase().replace(/\s+/g, '');
     
-    // Fuzzy matching database query
     const { isMatch, info, matchedPlate } = await checkRegisteredDbFuzzy(cleanPlate);
     const status = isMatch ? 'GRANTED' : 'DENIED';
     const resolvedPlate = isMatch ? matchedPlate : cleanPlate;
     const dummyPhoto = '/static/images/simulated_car.svg';
 
-    // Log to MongoDB
     const log = new GateLog({
       plateNumber: resolvedPlate,
       status,
@@ -462,7 +921,6 @@ app.post('/api/simulate', async (req, res) => {
     });
     await log.save();
 
-    // Broadcast to Guard via Socket.io
     const socketPayload = {
       plate: resolvedPlate,
       status,
