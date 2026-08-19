@@ -22,11 +22,10 @@ async function seedDatabase() {
 
     // Seed Residents
     const residentsData = [
-      { flatNumber: '420', familyName: 'Ishani Patel', contact: '+91 98765 43210', photoUrl: '/static/images/avatar1.svg' },
-      { flatNumber: '420', familyName: 'Hema Patel', contact: '+91 98765 43211', photoUrl: '/static/images/avatar2.svg' },
-      { flatNumber: '118', familyName: 'Tanvi Sharma', contact: '+91 98765 43212', photoUrl: '/static/images/avatar3.svg' },
-      { flatNumber: '119', familyName: 'Amit Sharma', contact: '+91 98765 43213', photoUrl: '/static/images/avatar4.svg' },
-      { flatNumber: '506', familyName: 'Sai Patel', contact: '+91 99999 88888', photoUrl: '/static/images/avatar1.svg' }
+      { flatNumber: '420', familyName: 'Ishani Patel', familyMembers: 'Ishani Patel, Hema Patel', contact: '+91 98765 43210', photoUrl: '/static/images/avatar1.svg' },
+      { flatNumber: '118', familyName: 'Tanvi Sharma', familyMembers: 'Tanvi Sharma', contact: '+91 98765 43212', photoUrl: '/static/images/avatar3.svg' },
+      { flatNumber: '119', familyName: 'Amit Sharma', familyMembers: 'Amit Sharma', contact: '+91 98765 43213', photoUrl: '/static/images/avatar4.svg' },
+      { flatNumber: '506', familyName: 'Sai Patel', familyMembers: 'Sai Patel', contact: '+91 99999 88888', photoUrl: '/static/images/avatar1.svg' }
     ];
 
     const seededResidents = await Resident.insertMany(residentsData);
@@ -35,9 +34,9 @@ async function seedDatabase() {
     // Seed Vehicles
     const vehiclesData = [
       { plateNumber: 'MH12AB1234', resident: seededResidents[0]._id, makeModel: 'Honda City', color: 'White' },
-      { plateNumber: 'MH14CD5678', resident: seededResidents[1]._id, makeModel: 'Hyundai i20', color: 'Silver' },
-      { plateNumber: 'GJ01EF9012', resident: seededResidents[2]._id, makeModel: 'Maruti Swift', color: 'Red' },
-      { plateNumber: 'HR98AA0000', resident: seededResidents[4]._id, makeModel: 'Fortuner', color: 'Black' }
+      { plateNumber: 'MH14CD5678', resident: seededResidents[0]._id, makeModel: 'Hyundai i20', color: 'Silver' },
+      { plateNumber: 'GJ01EF9012', resident: seededResidents[1]._id, makeModel: 'Maruti Swift', color: 'Red' },
+      { plateNumber: 'HR98AA0000', resident: seededResidents[3]._id, makeModel: 'Fortuner', color: 'Black' }
     ];
 
     const seededVehicles = await Vehicle.insertMany(vehiclesData);

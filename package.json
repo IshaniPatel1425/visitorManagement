@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run server\" \"npm run client\"",
-    "server": "nodemon server.js",
+    "server": "nodemon --ignore uploads/ --ignore static/uploads/ server.js",
     "client": "vite",
     "build": "vite build",
     "seed": "node seed.js",

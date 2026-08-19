@@ -60,7 +60,10 @@ mongoose.connect(MONGO_URI)
 // Setup Multer Storage for file uploads
 const storageGate = multer.diskStorage({
   destination: (req, file, cb) => cb(null, 'uploads/gate/'),
-  filename: (req, file, cb) => cb(null, `${uuidv4()}.jpg`)
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `${uuidv4()}${ext}`);
+  }
 });
 const uploadGate = multer({ storage: storageGate });
 
@@ -162,6 +165,11 @@ async function checkRegisteredDbFuzzy(plateText) {
 // WebSocket connection logs
 io.on('connection', (socket) => {
   console.log(`Socket client connected: ${socket.id}`);
+  
+  socket.on('video-stream-frame', (data) => {
+    socket.broadcast.emit('video-stream-frame', data);
+  });
+
   socket.on('disconnect', () => {
     console.log(`Socket client disconnected: ${socket.id}`);
   });
@@ -366,7 +374,9 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
   console.log(`[CAMERA] Spawning Python OCR for file: ${filePath}`);
   
   // Spawn python child process to run anpr_cli.py
-  const pythonProcess = spawn('python', ['anpr_cli.py', filePath]);
+  const pythonProcess = spawn('python', ['anpr_cli.py', filePath], {
+    env: { ...process.env, OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1' }
+  });
 
   let stdoutData = '';
   let stderrData = '';
@@ -386,13 +396,24 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
     }
 
     try {
-      const parsed = JSON.parse(stdoutData.trim());
+      const jsonMatch = stdoutData.match(/\{.*\}/);
+      if (!jsonMatch) {
+        throw new Error("Could not find valid JSON object in ANPR CLI output. Raw output was: " + stdoutData);
+      }
+      const parsed = JSON.parse(jsonMatch[0]);
       if (parsed.error) {
         return res.status(500).json({ success: false, error: parsed.error });
       }
 
       const scannedPlate = parsed.plate || 'UNKNOWN';
       console.log(`[OCR] Extracted plate: '${scannedPlate}'`);
+
+      // If a JPG frame was extracted from a video upload, update the webPath
+      let resolvedWebPath = webPath;
+      if (fs.existsSync(filePath + '.jpg')) {
+        resolvedWebPath = `${webPath}.jpg`;
+        console.log(`[VIDEO] Using extracted frame for layout: ${resolvedWebPath}`);
+      }
 
       // Run Mongoose Lookup (Exact and Fuzzy matching)
       const { isMatch, info, matchedPlate } = await checkRegisteredDbFuzzy(scannedPlate);
@@ -405,7 +426,7 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
         status,
         residentName: isMatch ? info.name : null,
         flatNumber: isMatch ? info.flat : null,
-        photoPath: webPath
+        photoPath: resolvedWebPath
       });
       await log.save();
 
@@ -419,7 +440,7 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
         photo_url: isMatch ? info.photo_url : '/static/images/unknown_avatar.svg',
         model: isMatch ? info.model : '-',
         color: isMatch ? info.color : '-',
-        photo_path: webPath
+        photo_path: resolvedWebPath
       };
       
       io.emit('new-scan', socketPayload);
