@@ -112,8 +112,7 @@ function GuardDashboard() {
   // Face scan state
   const [faceScanAlert, setFaceScanAlert] = useState(null); // null | {status, name, flat, phone, profile_photo_url, live_photo_url, score}
   const [faceScanVisible, setFaceScanVisible] = useState(false);
-  
-  const autoCloseTimer = useRef(null);
+
   const faceAlertTimer = useRef(null);
   const [liveStreamActive, setLiveStreamActive] = useState(false);
 
@@ -143,7 +142,6 @@ function GuardDashboard() {
   useEffect(() => {
     loadLogs();
     loadFaceLogs();
-    const socket = io();
 
     // 2. Connect WebSockets (Socket.io) for real-time scans
     const socket = io(); // Connects to the same domain
@@ -935,7 +933,7 @@ function ResidentPortal() {
 
               <h2 style={{ fontSize: '1.4rem', marginBottom: '4px' }}>{profile.family_name}</h2>
               <p style={{ color: 'var(--color-primary)', fontWeight: 600, fontSize: '0.95rem', marginBottom: '8px' }}>Flat Number: {profile.flat_number}</p>
-              
+
               {/* Face Registration Status */}
               <div className={`face-status-badge ${profile.head_face_registered ? 'ok' : 'warn'}`}>
                 <i className={`fa-solid ${profile.head_face_registered ? 'fa-face-smile' : 'fa-face-frown'}`}></i>
@@ -964,7 +962,7 @@ function ResidentPortal() {
 
           {/* Right Column */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '30px' }}>
-            
+
             {/* ── FAMILY MEMBERS SECTION ── */}
             <div className="glass-panel" style={{ padding: '24px' }}>
               <div className="panel-header" style={{ marginBottom: '16px' }}>
@@ -1251,7 +1249,7 @@ function MobileCamera() {
   const [useWebcam, setUseWebcam] = useState(true);
   const [scanStatus, setScanStatus] = useState('Ready to scan...');
   const [history, setHistory] = useState([]);
-  
+
   const [autoScanActive, setAutoScanActive] = useState(true);
   const [liveStreamActive, setLiveStreamActive] = useState(true);
 
@@ -1322,7 +1320,7 @@ function MobileCamera() {
         canvas.width = 320;
         canvas.height = 240;
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
+
         const base64Frame = canvas.toDataURL('image/jpeg', 0.5);
         socketRef.current.emit('video-stream-frame', base64Frame);
       }
@@ -1443,7 +1441,7 @@ function MobileCamera() {
           <>
             <video ref={videoRef} className="phone-video" autoPlay playsInline></video>
             <div className="capture-overlay"></div>
-            
+
             {liveStreamActive && (
               <div style={{ position: 'absolute', top: '12px', right: '12px', backgroundColor: 'rgba(239, 68, 68, 0.85)', padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <span className="live-dot" style={{ backgroundColor: 'white' }}></span>
@@ -1637,7 +1635,7 @@ function FaceRecognition() {
             }
           }
         }
-      } catch (_) {}
+      } catch (_) { }
     };
     const id = setInterval(poll, 1200);
     return () => clearInterval(id);
@@ -1692,7 +1690,7 @@ function FaceRecognition() {
 
       {/* ── LEFT COLUMN: Live Feed + Detected Household Profile ── */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-        
+
         {/* Live Camera Stream */}
         <div className="face-panel">
           <div className="face-panel-title">
@@ -1785,7 +1783,7 @@ function FaceRecognition() {
           ) : (
             /* Recognized Resident + Household Profile View */
             <div className="face-recognized-view">
-              
+
               {/* Top: Detected Person Info Card */}
               <div className="face-detected-person-box">
                 <div className="face-detected-person-left">
@@ -1816,7 +1814,7 @@ function FaceRecognition() {
                     <i className="fa-solid fa-shield-check"></i> RECOGNIZED RESIDENT
                   </div>
                   <h2 className="face-person-name">{detectedProfile.name}</h2>
-                  
+
                   <div className="face-meta-grid">
                     <div className="face-meta-item">
                       <span className="face-meta-label">Flat Number</span>
