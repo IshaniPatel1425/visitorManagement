@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 
 export default function App() {
   const [currentView, setCurrentView] = useState('landing'); // 'landing', 'guard', 'resident', 'camera', 'face'
-  
+
   return (
     <>
       <nav className="navbar">
@@ -115,6 +115,10 @@ function GuardDashboard() {
   
   const autoCloseTimer = useRef(null);
   const faceAlertTimer = useRef(null);
+  const [liveStreamActive, setLiveStreamActive] = useState(false);
+
+  const autoCloseTimer = useRef(null);
+  const liveTimeoutRef = useRef(null);
 
   const loadLogs = async () => {
     try {
@@ -141,13 +145,25 @@ function GuardDashboard() {
     loadFaceLogs();
     const socket = io();
 
-    // ANPR Plate scan events
+    // 2. Connect WebSockets (Socket.io) for real-time scans
+    const socket = io(); // Connects to the same domain
+
+    socket.on('video-stream-frame', (frameData) => {
+      setGatePhoto(frameData);
+      setLiveStreamActive(true);
+      if (liveTimeoutRef.current) clearTimeout(liveTimeoutRef.current);
+      liveTimeoutRef.current = setTimeout(() => {
+        setLiveStreamActive(false);
+      }, 1500);
+    });
+
     socket.on('new-scan', (data) => {
       console.log('Socket.io scan received:', data);
       if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
 
       setPlateText(data.plate);
       setGatePhoto(data.photo_path + '?t=' + Date.now());
+
       setResident({
         name: data.name, flat: data.flat, contact: data.contact,
         photo_url: data.photo_url + '?t=' + Date.now(),
@@ -196,6 +212,7 @@ function GuardDashboard() {
       socket.disconnect();
       if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
       if (faceAlertTimer.current) clearTimeout(faceAlertTimer.current);
+      if (liveTimeoutRef.current) clearTimeout(liveTimeoutRef.current);
     };
   }, []);
 
@@ -297,9 +314,9 @@ function GuardDashboard() {
         {/* Viewfinder and details */}
         <div className="scan-content-grid">
           <div className="glass-panel gate-view-container">
-            <div className="scan-tag">
-              <span className="live-dot"></span>
-              <span>GATE CAMERA STREAM</span>
+            <div className="scan-tag" style={{ backgroundColor: liveStreamActive ? 'rgba(239, 68, 68, 0.85)' : 'rgba(0, 0, 0, 0.7)' }}>
+              <span className="live-dot" style={{ backgroundColor: liveStreamActive ? '#fff' : 'var(--color-danger)' }}></span>
+              <span>{liveStreamActive ? 'LIVE GATE CAMERA FEED' : 'GATE CAMERA STREAM'}</span>
             </div>
             <img src={gatePhoto} className="gate-photo" alt="Gate camera feed" />
             <div className="scanner-overlay">
@@ -473,12 +490,12 @@ function GuardDashboard() {
           <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '20px' }}>Use these quick triggers to simulate plate reads directly without phone upload.</p>
           <div className="sim-controls">
             <div className="sim-button-grid">
-              <button className="btn btn-secondary" onClick={() => triggerSimulation('MH12AB1234')}>MH12AB1234<br/><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Ishani Flat 420)</span></button>
-              <button className="btn btn-secondary" onClick={() => triggerSimulation('MH14CD5678')}>MH14CD5678<br/><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Hema Flat 420)</span></button>
+              <button className="btn btn-secondary" onClick={() => triggerSimulation('MH12AB1234')}>MH12AB1234<br /><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Ishani Flat 420)</span></button>
+              <button className="btn btn-secondary" onClick={() => triggerSimulation('MH14CD5678')}>MH14CD5678<br /><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Hema Flat 420)</span></button>
             </div>
             <div className="sim-button-grid">
-              <button className="btn btn-secondary" onClick={() => triggerSimulation('GJ01EF9012')}>GJ01EF9012<br/><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Tanvi Flat 118)</span></button>
-              <button className="btn btn-secondary" onClick={() => triggerSimulation('HR98AA0000')}>HR98AA0000<br/><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Sai Patel Flat 506)</span></button>
+              <button className="btn btn-secondary" onClick={() => triggerSimulation('GJ01EF9012')}>GJ01EF9012<br /><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Tanvi Flat 118)</span></button>
+              <button className="btn btn-secondary" onClick={() => triggerSimulation('HR98AA0000')}>HR98AA0000<br /><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Sai Patel Flat 506)</span></button>
             </div>
             <div className="sim-button-grid">
               <button className="btn btn-secondary" onClick={() => triggerSimulation('RJ14CV0002')} style={{ gridColumn: 'span 2', backgroundColor: 'rgba(99,102,241,0.15)', borderColor: 'rgba(99,102,241,0.3)', color: '#a5b4fc' }}>
@@ -797,6 +814,7 @@ function ResidentPortal() {
           color: newColor.trim()
         })
       });
+
       const data = await res.json();
       if (res.ok) {
         setNewPlate(''); setNewModel(''); setNewColor('');
@@ -1021,7 +1039,7 @@ function ResidentPortal() {
             <div className="glass-panel" style={{ padding: '24px' }}>
               <h2><i className="fa-solid fa-car"></i> Registered Vehicles</h2>
               <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '20px' }}>Vehicles listed below will trigger "Access Granted" and open the gate automatically upon plate capture.</p>
-              
+
               <div className="vehicle-list">
                 {vehicles.length === 0 ? (
                   <div style={{ color: 'var(--text-muted)', padding: '10px 0', fontSize: '0.9rem' }}>No registered vehicles. Add one using the form below.</div>
@@ -1050,6 +1068,7 @@ function ResidentPortal() {
                     <input type="text" id="inputModel" className="text-input" style={{ width: '100%' }} placeholder="e.g. Honda City" value={newModel} onChange={(e) => setNewModel(e.target.value)} required />
                   </div>
                 </div>
+
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '15px', alignItems: 'end' }}>
                   <div className="form-group" style={{ marginBottom: 0 }}>
                     <label htmlFor="inputColor">Vehicle Color</label>
@@ -1064,6 +1083,7 @@ function ResidentPortal() {
             <div className="glass-panel" style={{ padding: '24px' }}>
               <h2><i className="fa-solid fa-route"></i> Flat Entry History</h2>
               <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '15px' }}>Historical list of when your vehicles crossed the gate.</p>
+
               <div style={{ maxHeight: '250px', overflowY: 'auto' }}>
                 <table className="logs-table">
                   <thead>
@@ -1226,17 +1246,27 @@ function ResidentPortal() {
       )}
     </div>
   );
-}
-
-// --- PHONE CAMERA PORTAL ---
+}// --- PHONE CAMERA PORTAL ---
 function MobileCamera() {
   const [useWebcam, setUseWebcam] = useState(true);
   const [scanStatus, setScanStatus] = useState('Ready to scan...');
   const [history, setHistory] = useState([]);
   
+  const [autoScanActive, setAutoScanActive] = useState(true);
+  const [liveStreamActive, setLiveStreamActive] = useState(true);
+
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const viewfinderContainerRef = useRef(null);
+  const socketRef = useRef(null);
+
+  // Initialize socket connection
+  useEffect(() => {
+    socketRef.current = io();
+    return () => {
+      if (socketRef.current) socketRef.current.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     if (!useWebcam) return;
@@ -1278,8 +1308,58 @@ function MobileCamera() {
     setUseWebcam(false);
   };
 
+  // Live video frame streaming loop
+  useEffect(() => {
+    if (!useWebcam || !liveStreamActive) return;
+
+    const streamInterval = setInterval(() => {
+      if (videoRef.current && canvasRef.current && socketRef.current) {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        const context = canvas.getContext('2d');
+
+        // Capture a low-res image for speed and network performance
+        canvas.width = 320;
+        canvas.height = 240;
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        const base64Frame = canvas.toDataURL('image/jpeg', 0.5);
+        socketRef.current.emit('video-stream-frame', base64Frame);
+      }
+    }, 250); // 4 FPS
+
+    return () => clearInterval(streamInterval);
+  }, [useWebcam, liveStreamActive]);
+
+  // Auto-scan loop for OCR
+  useEffect(() => {
+    if (!useWebcam || !autoScanActive) return;
+
+    const scanInterval = setInterval(() => {
+      if (videoRef.current && canvasRef.current) {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        const context = canvas.getContext('2d');
+
+        // Capture full resolution for high OCR accuracy
+        canvas.width = video.videoWidth || 800;
+        canvas.height = video.videoHeight || 600;
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        canvas.toBlob((blob) => {
+          if (blob) {
+            uploadPhoto(blob);
+          }
+        }, 'image/jpeg', 0.85);
+      }
+    }, 4500); // OCR scan every 4.5 seconds
+
+    return () => clearInterval(scanInterval);
+  }, [useWebcam, autoScanActive]);
+
+  // Upload photo blob
   const uploadPhoto = async (blob) => {
-    setScanStatus('Processing ANPR Scan...');
+    setScanStatus('Scanning barcode / license plate...');
     const formData = new FormData();
     formData.append('photo', blob, 'gate_capture.jpg');
 
@@ -1305,14 +1385,18 @@ function MobileCamera() {
     }
   };
 
+  // WebRTC Viewfinder Manual Capture
   const handleCapture = () => {
     if (!useWebcam || !videoRef.current || !canvasRef.current) return;
+
     if (viewfinderContainerRef.current) {
       viewfinderContainerRef.current.style.opacity = 0.3;
       setTimeout(() => { if (viewfinderContainerRef.current) viewfinderContainerRef.current.style.opacity = 1; }, 150);
     }
     const video = videoRef.current;
     const canvas = canvasRef.current;
+    const context = canvas.getContext('2d');
+
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -1338,14 +1422,40 @@ function MobileCamera() {
     <div className="phone-camera-container glass-panel">
       <div>
         <h2 style={{ fontSize: '1.5rem', marginBottom: '6px' }}><i className="fa-solid fa-camera"></i> Gate Camera Portal</h2>
-        <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Your phone is now acting as the gate entry camera.</p>
+        <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Your device is now acting as the gate camera feed.</p>
       </div>
+
+      {useWebcam && (
+        <div className="glass-panel" style={{ padding: '12px', display: 'flex', justifyContent: 'space-around', fontSize: '0.85rem' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+            <input type="checkbox" checked={liveStreamActive} onChange={(e) => setLiveStreamActive(e.target.checked)} />
+            <span>Stream Live Feed</span>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+            <input type="checkbox" checked={autoScanActive} onChange={(e) => setAutoScanActive(e.target.checked)} />
+            <span>Auto-Scan Gating</span>
+          </label>
+        </div>
+      )}
 
       <div ref={viewfinderContainerRef} className="phone-viewfinder" style={{ transition: 'opacity 0.15s ease' }}>
         {useWebcam ? (
           <>
             <video ref={videoRef} className="phone-video" autoPlay playsInline></video>
             <div className="capture-overlay"></div>
+            
+            {liveStreamActive && (
+              <div style={{ position: 'absolute', top: '12px', right: '12px', backgroundColor: 'rgba(239, 68, 68, 0.85)', padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span className="live-dot" style={{ backgroundColor: 'white' }}></span>
+                <span>FEED LIVE</span>
+              </div>
+            )}
+            {autoScanActive && (
+              <div style={{ position: 'absolute', top: '12px', left: '12px', backgroundColor: 'rgba(59, 130, 246, 0.85)', padding: '4px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <i className="fa-solid fa-circle-notch fa-spin"></i>
+                <span>AUTO-SCAN ACTIVE</span>
+              </div>
+            )}
           </>
         ) : (
           <div style={{ display: 'flex', width: '100%', height: '100%', backgroundColor: '#111827', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '20px', color: 'var(--text-secondary)', textAlign: 'center' }}>
@@ -1361,15 +1471,23 @@ function MobileCamera() {
 
       <div className="phone-controls">
         {useWebcam ? (
-          <button onClick={handleCapture} className="round-capture-btn">
-            <i className="fa-solid fa-aperture"></i>
-          </button>
+          <div>
+            <button onClick={handleCapture} className="round-capture-btn" style={{ marginBottom: '8px' }}>
+              <i className="fa-solid fa-aperture"></i>
+            </button>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Or tap button to scan manually</div>
+          </div>
         ) : (
-          <div style={{ textAlign: 'center', marginTop: '10px' }}>
-            <label htmlFor="fallbackFile" className="btn btn-primary" style={{ display: 'inline-flex', width: '100%', maxWidth: '250px', fontSize: '1.1rem', padding: '15px 20px', cursor: 'pointer' }}>
-              <i className="fa-solid fa-camera-retro"></i> Take &amp; Send Photo
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', marginTop: '10px' }}>
+            <label htmlFor="fallbackPhoto" className="btn btn-primary" style={{ display: 'inline-flex', width: '100%', maxWidth: '250px', fontSize: '1rem', padding: '12px 20px', cursor: 'pointer', justifyContent: 'center', gap: '8px' }}>
+              <i className="fa-solid fa-camera"></i> Take Live Photo
             </label>
-            <input type="file" id="fallbackFile" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={handleFileChange} />
+            <input type="file" id="fallbackPhoto" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={handleFileChange} />
+
+            <label htmlFor="fallbackVideo" className="btn btn-secondary" style={{ display: 'inline-flex', width: '100%', maxWidth: '250px', fontSize: '1rem', padding: '12px 20px', cursor: 'pointer', justifyContent: 'center', gap: '8px', border: '1px solid var(--border-color)', backgroundColor: 'transparent', color: '#fff' }}>
+              <i className="fa-solid fa-video"></i> Upload Video File
+            </label>
+            <input type="file" id="fallbackVideo" accept="video/*" style={{ display: 'none' }} onChange={handleFileChange} />
           </div>
         )}
         <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '10px' }}>
@@ -1433,7 +1551,7 @@ function FaceRecognition() {
         const r = await fetch('/face/api/status');
         const d = await r.json();
         setStatus(d);
-      } catch (_) {}
+      } catch (_) { }
     };
     fetchStatus();
     const id = setInterval(fetchStatus, 4000);
@@ -1446,7 +1564,7 @@ function FaceRecognition() {
       const r = await fetch('/face/api/db');
       const d = await r.json();
       setFaceDb(d);
-    } catch (_) {}
+    } catch (_) { }
   };
   useEffect(() => {
     refreshDb();

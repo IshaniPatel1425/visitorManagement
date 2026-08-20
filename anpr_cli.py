@@ -123,6 +123,70 @@ def preprocess_passes(image_path: str):
     return paths
 
 
+def is_video_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.3gp']
+
+
+def run_anpr_on_video(video_path: str) -> str:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return "UNKNOWN"
+        
+    frame_count = 0
+    detected_plate = "UNKNOWN"
+    saved_frame = None
+    middle_frame = None
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    middle_frame_idx = total_frames // 2 if total_frames > 0 else 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # Store middle frame as fallback thumbnail
+        if frame_count == middle_frame_idx:
+            middle_frame = frame.copy()
+            
+        # Sample every 5th frame to run fast and avoid bottleneck
+        if frame_count % 5 == 0:
+            # Save frame temporarily to run OCR
+            temp_path = video_path + f"_temp_{frame_count}.jpg"
+            cv2.imwrite(temp_path, frame)
+            
+            try:
+                plate = run_anpr(temp_path)
+            except Exception:
+                plate = "UNKNOWN"
+                
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+            # If we get a matching registered-style Indian plate, lock it and break
+            if plate != "UNKNOWN" and re.match(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$", plate):
+                detected_plate = plate
+                saved_frame = frame
+                break
+                
+            # Fallback to any detected word if we don't have anything yet
+            if plate != "UNKNOWN" and detected_plate == "UNKNOWN":
+                detected_plate = plate
+                saved_frame = frame
+                
+        frame_count += 1
+        
+    cap.release()
+    
+    # Save the frame image as video_path + ".jpg" for MERN to serve as thumbnail
+    frame_to_save = saved_frame if saved_frame is not None else middle_frame
+    if frame_to_save is not None:
+        cv2.imwrite(video_path + ".jpg", frame_to_save)
+        
+    return detected_plate
+
+
 def run_anpr(image_path: str) -> str:
     # Pass 1: Raw image
     plate_text = read_plate_text(image_path)
@@ -144,17 +208,20 @@ def run_anpr(image_path: str) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Missing image path parameter"}))
+        print(json.dumps({"error": "Missing file path parameter"}))
         sys.exit(1)
         
-    img_path = sys.argv[1]
-    if not os.path.exists(img_path):
-        print(json.dumps({"error": "Image file not found"}))
+    file_path = sys.argv[1]
+    if not os.path.exists(file_path):
+        print(json.dumps({"error": "File not found"}))
         sys.exit(1)
         
     try:
-        detected_plate = run_anpr(img_path)
-        # Print ONLY the clean JSON output to stdout
+        if is_video_file(file_path):
+            detected_plate = run_anpr_on_video(file_path)
+        else:
+            detected_plate = run_anpr(file_path)
+            
         print(json.dumps({"plate": detected_plate}))
     except Exception as e:
         print(json.dumps({"error": str(e)}))

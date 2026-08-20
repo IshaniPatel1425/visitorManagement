@@ -7,6 +7,9 @@ export default defineConfig({
   server: {
     host: '0.0.0.0', // Allow local network devices (like your phone) to connect
     port: 5173,
+    watch: {
+      ignored: ['**/uploads/**', '**/static/uploads/**']
+    },
     proxy: {
       '/api': {
         target: 'http://localhost:5000',
