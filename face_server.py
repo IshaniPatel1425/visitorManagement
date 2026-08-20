@@ -19,10 +19,12 @@ import pickle
 import numpy as np
 import threading
 import time
+import requests
+import tempfile
 from flask import Flask, Response, jsonify, request, render_template_string
 
 # ─────────────────────────────────────────────────────
-# Paths
+# Paths & Config
 # ─────────────────────────────────────────────────────
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 FACE_DETECT_MODEL = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
@@ -30,6 +32,15 @@ FACE_RECOG_MODEL  = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onn
 EMBEDDINGS_FILE   = os.path.join(os.path.dirname(__file__), "face_embeddings.pkl")
 UPLOADS_DIR       = os.path.join(os.path.dirname(__file__), "face_uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# Node.js server webhook URL
+NODE_SERVER_URL = os.environ.get("NODE_SERVER_URL", "http://localhost:5000")
+
+# Cooldown state: prevents flooding the guard with repeat events
+# Key: face_key (e.g. "506_Sai Patel" or "Unknown"), Value: last sent timestamp
+_webhook_cooldown: dict = {}
+_webhook_cooldown_lock = threading.Lock()
+COOLDOWN_SECONDS = 10.0
 
 # ─────────────────────────────────────────────────────
 # Load OpenCV DNN models
@@ -213,6 +224,9 @@ class CameraStream:
 
                     detections_out.append({"name": name, "score": round(float(match_score), 3), "box": [x, y, fw, fh]})
 
+                    # ── Webhook: notify Node.js server with cooldown ──
+                    self._maybe_send_webhook(name, match_score, frame, x, y, fw, fh)
+
             with self._lock:
                 self._frame = annotated
                 if detections_out:
@@ -220,6 +234,53 @@ class CameraStream:
 
             frame_count += 1
             time.sleep(0.03)   # ~30 fps cap
+
+    def _maybe_send_webhook(self, name, score, frame, x, y, fw, fh):
+        """Send face event to Node.js server if outside cooldown window."""
+        now = time.time()
+        face_key = name  # "Unknown" or "flatNumber_memberName"
+
+        with _webhook_cooldown_lock:
+            last_sent = _webhook_cooldown.get(face_key, 0)
+            if now - last_sent < COOLDOWN_SECONDS:
+                return  # Still in cooldown window
+            _webhook_cooldown[face_key] = now
+
+        # Crop the face region with a small margin for the snapshot
+        margin = 20
+        h_frame, w_frame = frame.shape[:2]
+        cx1 = max(0, x - margin)
+        cy1 = max(0, y - margin)
+        cx2 = min(w_frame, x + fw + margin)
+        cy2 = min(h_frame, y + fh + margin)
+        face_crop = frame[cy1:cy2, cx1:cx2]
+
+        # Send webhook in a separate daemon thread to not block capture
+        threading.Thread(
+            target=self._send_webhook_request,
+            args=(face_key, score, face_crop.copy()),
+            daemon=True
+        ).start()
+
+    @staticmethod
+    def _send_webhook_request(face_key, score, face_crop):
+        """POST face event to Node.js /api/face-event."""
+        try:
+            _, buf = cv2.imencode(".jpg", face_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            img_bytes = buf.tobytes()
+
+            files = {"photo": ("face_event.jpg", img_bytes, "image/jpeg")}
+            data  = {"matched_key": face_key, "score": str(round(score, 4))}
+
+            resp = requests.post(
+                f"{NODE_SERVER_URL}/api/face-event",
+                files=files,
+                data=data,
+                timeout=5
+            )
+            print(f"[WEBHOOK] Sent face event for '{face_key}': {resp.status_code}")
+        except Exception as e:
+            print(f"[WEBHOOK] Failed to send face event for '{face_key}': {e}")
 
     def get_jpeg(self):
         with self._lock:
@@ -814,6 +875,25 @@ def api_db():
 @app.route("/api/detections")
 def api_detections():
     return jsonify({"faces": cam.get_detections()})
+
+@app.route("/detect_face_only", methods=["POST"])
+def detect_face_only():
+    """Validate that an uploaded image contains at least one face. Does NOT register."""
+    if "photo" not in request.files:
+        return jsonify({"success": False, "message": "No photo uploaded."})
+
+    file = request.files["photo"]
+    img_bytes = np.frombuffer(file.read(), np.uint8)
+    frame = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+    if frame is None:
+        return jsonify({"success": False, "message": "Cannot decode image. Please upload a valid JPG or PNG."})
+
+    faces = detect_faces(frame)
+    if not faces:
+        return jsonify({"success": False, "message": "No face detected in the uploaded photo. Please use a clear, well-lit frontal photo with the face visible."})
+
+    return jsonify({"success": True, "faces_count": len(faces)})
+
 
 @app.route("/register_photo", methods=["POST"])
 def register_photo():
