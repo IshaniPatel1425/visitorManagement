@@ -33,6 +33,7 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/gate_guard';
 const FACE_SERVER_URL = process.env.FACE_SERVER_URL || 'http://localhost:5001';
+const ANPR_SERVER_URL = process.env.ANPR_SERVER_URL || 'http://localhost:5002';
 
 // Middleware
 app.use(cors());
@@ -126,29 +127,53 @@ function getEditDistance(s1, s2) {
   return distances[distances.length - 1];
 }
 
-// Fuzzy Database Matcher
+// ── Plate Debounce Map ────────────────────────────────────────────────────────
+// Prevents the same plate from being logged/emitted more than once per 60s.
+// Key: normalized plate string. Value: { time: Date.now(), logId }
+const plateScanCache = new Map();
+const PLATE_DEBOUNCE_MS = 60_000; // 60 seconds
+
+function isPlateDebounced(plate) {
+  const entry = plateScanCache.get(plate);
+  if (!entry) return false;
+  return (Date.now() - entry.time) < PLATE_DEBOUNCE_MS;
+}
+
+function markPlateSeen(plate, logId) {
+  plateScanCache.set(plate, { time: Date.now(), logId });
+  // Auto-clean old entries every 5 minutes to prevent memory leak
+  setTimeout(() => plateScanCache.delete(plate), PLATE_DEBOUNCE_MS + 1000);
+}
+
+// Fuzzy Database Matcher — returns full household data including all family members
 async function checkRegisteredDbFuzzy(plateText) {
   if (!plateText) return { isMatch: false, info: null, matchedPlate: null };
 
   const cleanScanned = plateText.toUpperCase().replace(/\s+/g, '');
   const vehicles = await Vehicle.find().populate('resident');
 
+  // Helper to build full household info object from a vehicle+resident
+  const buildInfo = (veh) => ({
+    name: veh.resident.familyName,
+    flat: veh.resident.flatNumber,
+    contact: veh.resident.contact,
+    photo_url: veh.resident.photoUrl || '/static/images/unknown_avatar.svg',
+    model: veh.makeModel,
+    color: veh.color,
+    // All household members with their photos
+    family_members: (veh.resident.familyMembers || []).map(m => ({
+      id: m._id,
+      name: m.name,
+      phone: m.phone,
+      photo_url: m.photoUrl || '/static/images/unknown_avatar.svg'
+    }))
+  });
+
   // 1. Exact Match Pass
   for (let veh of vehicles) {
     const cleanReg = veh.plateNumber.toUpperCase().replace(/\s+/g, '');
     if (cleanReg === cleanScanned) {
-      return {
-        isMatch: true,
-        info: {
-          name: veh.resident.familyName,
-          flat: veh.resident.flatNumber,
-          contact: veh.resident.contact,
-          photo_url: veh.resident.photoUrl || '/static/images/unknown_avatar.svg',
-          model: veh.makeModel,
-          color: veh.color
-        },
-        matchedPlate: veh.plateNumber
-      };
+      return { isMatch: true, info: buildInfo(veh), matchedPlate: veh.plateNumber };
     }
   }
 
@@ -168,18 +193,7 @@ async function checkRegisteredDbFuzzy(plateText) {
   const maxAllowed = cleanScanned.length >= 8 ? 2 : 1;
   if (minDist <= maxAllowed && bestVeh) {
     console.log(`[FUZZY] Scanned '${cleanScanned}' resolved to registered '${bestVeh.plateNumber}' (Distance: ${minDist})`);
-    return {
-      isMatch: true,
-      info: {
-        name: bestVeh.resident.familyName,
-        flat: bestVeh.resident.flatNumber,
-        contact: bestVeh.resident.contact,
-        photo_url: bestVeh.resident.photoUrl || '/static/images/unknown_avatar.svg',
-        model: bestVeh.makeModel,
-        color: bestVeh.color
-      },
-      matchedPlate: bestVeh.plateNumber
-    };
+    return { isMatch: true, info: buildInfo(bestVeh), matchedPlate: bestVeh.plateNumber };
   }
 
   return { isMatch: false, info: null, matchedPlate: null };
@@ -827,6 +841,131 @@ app.post('/api/face-event', uploadFaceEvent.single('photo'), async (req, res) =>
   }
 });
 
+// 12a. Live ANPR Scan — accepts a frame from Guard Dashboard webcam,
+//      proxies it to the persistent anpr_server.py for fast plate detection.
+//      Does NOT save to DB or emit socket — only returns detection result.
+app.post('/api/anpr/live-scan', uploadGate.single('photo'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: 'No photo' });
+
+  const filePath = path.join(__dirname, req.file.path);
+
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const { default: FormDataNode } = await import('form-data');
+
+    const form = new FormDataNode();
+    form.append('photo', fs.createReadStream(filePath));
+
+    const response = await fetch(`${ANPR_SERVER_URL}/anpr/scan`, {
+      method: 'POST',
+      body: form,
+      headers: form.getHeaders(),
+      signal: AbortSignal.timeout(8000)
+    });
+    const result = await response.json();
+
+    // Clean up temp file
+    try { fs.unlinkSync(filePath); } catch {}
+
+    if (result.error) return res.status(500).json({ success: false, error: result.error });
+
+    return res.json({
+      success: true,
+      plate: result.plate || 'UNKNOWN',
+      confidence: result.confidence || 0,
+      bbox: result.bbox || null
+    });
+  } catch (err) {
+    // Fallback: if anpr_server.py is down, spawn anpr_cli.py
+    console.warn('[ANPR LIVE] Persistent server unavailable, falling back to spawn:', err.message);
+
+    const pythonBin = fs.existsSync(path.join(__dirname, '.venv', 'Scripts', 'python.exe'))
+      ? path.join(__dirname, '.venv', 'Scripts', 'python.exe')
+      : (process.env.PYTHON_PATH || 'python');
+
+    const pythonProcess = spawn(pythonBin, ['anpr_cli.py', filePath], {
+      env: { ...process.env, OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1' }
+    });
+
+    let stdoutData = '';
+    pythonProcess.stdout.on('data', d => { stdoutData += d.toString(); });
+    pythonProcess.on('close', (code) => {
+      try { fs.unlinkSync(filePath); } catch {}
+      if (code !== 0) return res.status(500).json({ success: false, error: 'OCR failure' });
+      const jsonMatch = stdoutData.match(/\{.*\}/);
+      if (!jsonMatch) return res.status(500).json({ success: false, error: 'No JSON output' });
+      const parsed = JSON.parse(jsonMatch[0]);
+      res.json({ success: true, plate: parsed.plate || 'UNKNOWN', confidence: 0, bbox: null });
+    });
+  }
+});
+
+// 12b. ANPR Lookup — checks plate against DB, saves log, emits socket event.
+//      Called by Guard Dashboard after getting a plate from live-scan.
+//      Has 60s debounce to prevent duplicate logs for the same vehicle.
+app.get('/api/anpr/lookup', async (req, res) => {
+  const { plate } = req.query;
+  if (!plate || plate === 'UNKNOWN') {
+    return res.json({ success: false, isMatch: false, debounced: false });
+  }
+
+  const cleanPlate = plate.toUpperCase().replace(/\s+/g, '');
+
+  // Check debounce: if this plate was seen in last 60s, return cached info without re-logging
+  if (isPlateDebounced(cleanPlate)) {
+    console.log(`[ANPR LOOKUP] Debounced plate: ${cleanPlate}`);
+    return res.json({ success: true, debounced: true, plate: cleanPlate });
+  }
+
+  try {
+    const { isMatch, info, matchedPlate } = await checkRegisteredDbFuzzy(cleanPlate);
+    const status = isMatch ? 'GRANTED' : 'DENIED';
+    const resolvedPlate = isMatch ? matchedPlate : cleanPlate;
+
+    // Save gate log
+    const log = new GateLog({
+      plateNumber: resolvedPlate,
+      status,
+      residentName: isMatch ? info.name : null,
+      flatNumber: isMatch ? info.flat : null,
+      photoPath: '/static/images/simulated_car.svg'
+    });
+    await log.save();
+
+    markPlateSeen(resolvedPlate, log._id);
+
+    // Build and emit socket payload with full household info
+    const socketPayload = {
+      plate: resolvedPlate,
+      status,
+      name: isMatch ? info.name : 'Unknown Visitor',
+      flat: isMatch ? info.flat : '-',
+      contact: isMatch ? info.contact : '-',
+      photo_url: isMatch ? info.photo_url : '/static/images/unknown_avatar.svg',
+      model: isMatch ? info.model : '-',
+      color: isMatch ? info.color : '-',
+      // Full household member list with photos
+      family_members: isMatch ? (info.family_members || []) : [],
+      photo_path: '/static/images/simulated_car.svg',
+      log_id: log._id
+    };
+    io.emit('new-plate-scan', socketPayload);
+    console.log(`[ANPR LOOKUP] ${status}: ${resolvedPlate}${isMatch ? ` → ${info.name} (Flat ${info.flat})` : ''}`);
+
+    res.json({
+      success: true,
+      debounced: false,
+      isMatch,
+      status,
+      plate: resolvedPlate,
+      info: isMatch ? info : null
+    });
+  } catch (err) {
+    console.error('[ANPR LOOKUP] Error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // 12. Gate Camera snapshot upload (Node spawns Python EasyOCR process)
 app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
   if (!req.file) {
@@ -838,8 +977,15 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
 
   console.log(`[CAMERA] Spawning Python OCR for file: ${filePath}`);
   
+  // Resolve Python executable: check local .venv first, then PYTHON_PATH, fallback to 'python'
+  const pythonBin = fs.existsSync(path.join(__dirname, '.venv', 'Scripts', 'python.exe'))
+    ? path.join(__dirname, '.venv', 'Scripts', 'python.exe')
+    : (fs.existsSync(path.join(__dirname, '.venv', 'bin', 'python'))
+      ? path.join(__dirname, '.venv', 'bin', 'python')
+      : (process.env.PYTHON_PATH || 'python'));
+
   // Spawn python child process to run anpr_cli.py
-  const pythonProcess = spawn('python', ['anpr_cli.py', filePath], {
+  const pythonProcess = spawn(pythonBin, ['anpr_cli.py', filePath], {
     env: { ...process.env, OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1' }
   });
 
@@ -882,7 +1028,7 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
         status,
         residentName: isMatch ? info.name : null,
         flatNumber: isMatch ? info.flat : null,
-        photoPath: resolvedWebPath
+        photoPath: webPath
       });
       await log.save();
 
@@ -895,11 +1041,14 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
         photo_url: isMatch ? info.photo_url : '/static/images/unknown_avatar.svg',
         model: isMatch ? info.model : '-',
         color: isMatch ? info.color : '-',
-        photo_path: resolvedWebPath
+        // Full household member list with photos
+        family_members: isMatch ? (info.family_members || []) : [],
+        photo_path: webPath
       };
       
-      io.emit('new-scan', socketPayload);
-      console.log(`[SOCKET] Emitted new-scan event for: ${resolvedPlate}`);
+      io.emit('new-plate-scan', socketPayload);
+      io.emit('new-scan', socketPayload); // keep backward compat
+      console.log(`[SOCKET] Emitted new-plate-scan event for: ${resolvedPlate}`);
 
       res.json({
         success: true,
@@ -909,7 +1058,7 @@ app.post('/api/gate-camera/upload', uploadGate.single('photo'), (req, res) => {
 
     } catch (err) {
       console.error('Error handling ANPR callback:', err);
-      res.status(500).json({ success: false, error: 'Database logging error' });
+      res.status(500).json({ success: false, error: err.message || 'Database logging error' });
     }
   });
 });
@@ -945,11 +1094,14 @@ app.post('/api/simulate', async (req, res) => {
       photo_url: isMatch ? info.photo_url : '/static/images/unknown_avatar.svg',
       model: isMatch ? info.model : '-',
       color: isMatch ? info.color : '-',
+      // Full household member list with photos
+      family_members: isMatch ? (info.family_members || []) : [],
       photo_path: dummyPhoto
     };
     
-    io.emit('new-scan', socketPayload);
-    console.log(`[SIMULATE] Emitted new-scan event for: ${resolvedPlate}`);
+    io.emit('new-plate-scan', socketPayload);
+    io.emit('new-scan', socketPayload); // backward compat
+    console.log(`[SIMULATE] Emitted new-plate-scan event for: ${resolvedPlate}`);
 
     res.json({
       success: true,

@@ -94,14 +94,15 @@ function LandingView({ onViewChange }) {
   );
 }
 
+
 // --- GUARD DASHBOARD ---
 function GuardDashboard() {
   const [scanState, setScanState] = useState('idle'); // 'idle', 'granted', 'denied'
   const [plateText, setPlateText] = useState('WAITING...');
-  const [gatePhoto, setGatePhoto] = useState('/static/images/simulated_car.svg');
   const [resident, setResident] = useState({
-    name: 'Unknown Visitor', flat: '-', contact: '-',
-    photo_url: '/static/images/unknown_avatar.svg', model: '-', color: '-'
+    name: 'Waiting for scan\u2026', flat: '-', contact: '-',
+    photo_url: '/static/images/unknown_avatar.svg', model: '-', color: '-',
+    family_members: []
   });
   const [logs, setLogs] = useState([]);
   const [faceLogs, setFaceLogs] = useState([]);
@@ -109,248 +110,393 @@ function GuardDashboard() {
   const [gateStateText, setGateStateText] = useState('Barrier State: CLOSED');
   const [customPlateInput, setCustomPlateInput] = useState('');
 
+  // Webcam ANPR state
+  const [webcamReady, setWebcamReady] = useState(false);
+  const [webcamError, setWebcamError] = useState(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [lastDetectedPlate, setLastDetectedPlate] = useState(null);
+  const lastDetectedRef = useRef({ plate: null, time: 0 });
+
+  // Stranger alert modal
+  const [strangerAlert, setStrangerAlert] = useState(null);
+  const strangerDismissTimer = useRef(null);
+
   // Face scan state
-  const [faceScanAlert, setFaceScanAlert] = useState(null); // null | {status, name, flat, phone, profile_photo_url, live_photo_url, score}
+  const [faceScanAlert, setFaceScanAlert] = useState(null);
   const [faceScanVisible, setFaceScanVisible] = useState(false);
 
+  // Refs
+  const videoRef = useRef(null);
+  const overlayCanvasRef = useRef(null);
+  const captureCanvasRef = useRef(null);
+  const webcamStreamRef = useRef(null);
+  const scanIntervalRef = useRef(null);
   const faceAlertTimer = useRef(null);
-  const [liveStreamActive, setLiveStreamActive] = useState(false);
-
   const autoCloseTimer = useRef(null);
-  const liveTimeoutRef = useRef(null);
 
   const loadLogs = async () => {
-    try {
-      const res = await fetch('/api/logs');
-      const data = await res.json();
-      setLogs(data);
-    } catch (err) {
-      console.error('Error fetching logs:', err);
-    }
+    try { const res = await fetch('/api/logs'); setLogs(await res.json()); }
+    catch (err) { console.error('Error fetching logs:', err); }
   };
 
   const loadFaceLogs = async () => {
-    try {
-      const res = await fetch('/api/face-logs');
-      const data = await res.json();
-      setFaceLogs(data);
-    } catch (err) {
-      console.error('Error fetching face logs:', err);
-    }
+    try { const res = await fetch('/api/face-logs'); setFaceLogs(await res.json()); }
+    catch (err) { console.error('Error fetching face logs:', err); }
   };
 
-  useEffect(() => {
-    loadLogs();
-    loadFaceLogs();
-
-    // 2. Connect WebSockets (Socket.io) for real-time scans
-    const socket = io(); // Connects to the same domain
-
-    socket.on('video-stream-frame', (frameData) => {
-      setGatePhoto(frameData);
-      setLiveStreamActive(true);
-      if (liveTimeoutRef.current) clearTimeout(liveTimeoutRef.current);
-      liveTimeoutRef.current = setTimeout(() => {
-        setLiveStreamActive(false);
-      }, 1500);
-    });
-
-    socket.on('new-scan', (data) => {
-      console.log('Socket.io scan received:', data);
-      if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
-
-      setPlateText(data.plate);
-      setGatePhoto(data.photo_path + '?t=' + Date.now());
-
-      setResident({
-        name: data.name, flat: data.flat, contact: data.contact,
-        photo_url: data.photo_url + '?t=' + Date.now(),
-        model: data.model, color: data.color
-      });
-
-      if (data.status === 'GRANTED') {
-        setScanState('granted');
-        setBarrierOpen(true);
-        setGateStateText('Barrier State: OPEN (AUTO)');
-        speak(`Access Granted. Welcome ${data.name} of flat ${data.flat}.`);
-        autoCloseTimer.current = setTimeout(() => {
-          setBarrierOpen(false);
-          setGateStateText('Barrier State: CLOSED');
-          setScanState('idle');
-        }, 6000);
-      } else {
-        setScanState('denied');
-        setBarrierOpen(false);
-        setGateStateText('Barrier State: CLOSED');
-        speak('Warning. Unregistered vehicle detected at gate.');
+  // Webcam management
+  const startWebcam = useCallback(async () => {
+    if (webcamStreamRef.current) return;
+    try {
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
-      loadLogs();
-    });
-
-    // Face Verification events
-    socket.on('new-face-scan', (data) => {
-      console.log('Face scan event received:', data);
-      setFaceScanAlert(data);
-      setFaceScanVisible(true);
-
-      if (faceAlertTimer.current) clearTimeout(faceAlertTimer.current);
-
-      if (data.status === 'RECOGNIZED') {
-        speak(`Welcome ${data.name} of flat ${data.flat}.`);
-        // Auto-dismiss recognized after 8 seconds
-        faceAlertTimer.current = setTimeout(() => setFaceScanVisible(false), 8000);
-      } else {
-        speak('Warning! Stranger detected at the gate. Please verify immediately.');
-        // Keep stranger alert visible until manually dismissed
+      webcamStreamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.onloadedmetadata = () => { setWebcamReady(true); setWebcamError(null); };
       }
-      loadFaceLogs();
-    });
-
-    return () => {
-      socket.disconnect();
-      if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
-      if (faceAlertTimer.current) clearTimeout(faceAlertTimer.current);
-      if (liveTimeoutRef.current) clearTimeout(liveTimeoutRef.current);
-    };
+    } catch (err) {
+      setWebcamError(err.message);
+      setWebcamReady(false);
+    }
   }, []);
 
-  const speak = (text) => {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 0.95;
-      utterance.pitch = 1.0;
-      window.speechSynthesis.speak(utterance);
+  const stopWebcam = useCallback(() => {
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach(t => t.stop());
+      webcamStreamRef.current = null;
     }
+    setWebcamReady(false);
+  }, []);
+
+  // Canvas bounding box overlay
+  const drawBbox = useCallback((bbox, isMatch) => {
+    const canvas = overlayCanvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video || !bbox) return;
+    canvas.width = video.clientWidth;
+    canvas.height = video.clientHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const scaleX = canvas.width / (video.videoWidth || canvas.width);
+    const scaleY = canvas.height / (video.videoHeight || canvas.height);
+    const x = bbox.x * scaleX, y = bbox.y * scaleY;
+    const w = bbox.w * scaleX, h = bbox.h * scaleY;
+    const color = isMatch === true ? '#22c55e' : isMatch === false ? '#ef4444' : '#f59e0b';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = isMatch === true ? 'rgba(34,197,94,0.85)' : isMatch === false ? 'rgba(239,68,68,0.85)' : 'rgba(245,158,11,0.85)';
+    ctx.fillRect(x, y - 26, Math.min(w, 180), 26);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px monospace';
+    ctx.shadowBlur = 0;
+    ctx.fillText(isMatch === true ? '\u2713 REGISTERED' : isMatch === false ? '\u2717 UNKNOWN' : '\u25cb READING\u2026', x + 6, y - 7);
+  }, []);
+
+  const clearOverlay = useCallback(() => {
+    const canvas = overlayCanvasRef.current;
+    if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  }, []);
+
+  // Plate DB lookup
+  const lookupPlate = useCallback(async (plate, capturedDataUrl, bbox) => {
+    const now = Date.now();
+    if (plate === lastDetectedRef.current.plate && (now - lastDetectedRef.current.time) < 60000) return null;
+    lastDetectedRef.current = { plate, time: now };
+    setLastDetectedPlate(plate);
+    try {
+      const res = await fetch('/api/anpr/lookup?plate=' + encodeURIComponent(plate));
+      const data = await res.json();
+      if (data.debounced) return null;
+      const isMatch = data.isMatch;
+      drawBbox(bbox, isMatch);
+      if (isMatch && data.info) {
+        setResident({
+          name: data.info.name, flat: data.info.flat, contact: data.info.contact,
+          photo_url: (data.info.photo_url || '/static/images/unknown_avatar.svg') + '?t=' + Date.now(),
+          model: data.info.model || '-', color: data.info.color || '-',
+          family_members: data.info.family_members || []
+        });
+        setPlateText(data.plate); setScanState('granted');
+        setBarrierOpen(true); setGateStateText('Barrier State: OPEN (AUTO)'); setStrangerAlert(null);
+        speak('Access Granted. Welcome ' + data.info.name + ' of flat ' + data.info.flat + '.');
+        if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
+        autoCloseTimer.current = setTimeout(() => { setBarrierOpen(false); setGateStateText('Barrier State: CLOSED'); setScanState('idle'); }, 8000);
+      } else {
+        setResident({ name: 'Unknown Visitor', flat: '-', contact: '-', photo_url: '/static/images/unknown_avatar.svg', model: '-', color: '-', family_members: [] });
+        setPlateText(data.plate || plate); setScanState('denied');
+        setBarrierOpen(false); setGateStateText('Barrier State: CLOSED');
+        setStrangerAlert({ plate: data.plate || plate, capturedFrame: capturedDataUrl });
+        speak('Warning! Unregistered vehicle detected at gate. Please verify immediately.');
+        if (strangerDismissTimer.current) clearTimeout(strangerDismissTimer.current);
+        strangerDismissTimer.current = setTimeout(() => setStrangerAlert(null), 30000);
+      }
+      loadLogs();
+      return isMatch;
+    } catch (err) { console.error('[LOOKUP]', err); return null; }
+  }, [drawBbox]);
+
+  // Capture frame and run ANPR scan
+  const captureAndScan = useCallback(async () => {
+    if (!videoRef.current || !captureCanvasRef.current || !webcamReady || isScanning) return;
+    if (!videoRef.current.videoWidth) return;
+    setIsScanning(true);
+    const video = videoRef.current;
+    const canvas = captureCanvasRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const capturedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+    canvas.toBlob(async (blob) => {
+      if (!blob) { setIsScanning(false); return; }
+      const fd = new FormData();
+      fd.append('photo', blob, 'frame.jpg');
+      try {
+        const res = await fetch('/api/anpr/live-scan', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!data.success || !data.plate || data.plate === 'UNKNOWN') { clearOverlay(); return; }
+        if (!/^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$/.test(data.plate)) { clearOverlay(); return; }
+        drawBbox(data.bbox, null);
+        await lookupPlate(data.plate, capturedDataUrl, data.bbox);
+      } catch (err) { console.error('[SCAN]', err.message); clearOverlay(); }
+      finally { setIsScanning(false); }
+    }, 'image/jpeg', 0.85);
+  }, [webcamReady, isScanning, drawBbox, clearOverlay, lookupPlate]);
+
+  // Socket.io + startup
+  useEffect(() => {
+    loadLogs(); loadFaceLogs(); startWebcam();
+    const socket = io();
+    const handleScan = (data) => {
+      if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
+      setPlateText(data.plate);
+      setResident({ name: data.name, flat: data.flat, contact: data.contact, photo_url: (data.photo_url || '/static/images/unknown_avatar.svg') + '?t=' + Date.now(), model: data.model, color: data.color, family_members: data.family_members || [] });
+      if (data.status === 'GRANTED') {
+        setScanState('granted'); setBarrierOpen(true); setGateStateText('Barrier State: OPEN (AUTO)'); setStrangerAlert(null);
+        speak('Access Granted. Welcome ' + data.name + ' of flat ' + data.flat + '.');
+        autoCloseTimer.current = setTimeout(() => { setBarrierOpen(false); setGateStateText('Barrier State: CLOSED'); setScanState('idle'); }, 8000);
+      } else {
+        setScanState('denied'); setBarrierOpen(false); setGateStateText('Barrier State: CLOSED');
+        setStrangerAlert({ plate: data.plate, capturedFrame: null });
+        speak('Warning! Unregistered vehicle detected at gate.');
+        if (strangerDismissTimer.current) clearTimeout(strangerDismissTimer.current);
+        strangerDismissTimer.current = setTimeout(() => setStrangerAlert(null), 30000);
+      }
+      loadLogs();
+    };
+    socket.on('new-plate-scan', handleScan);
+    socket.on('new-scan', handleScan);
+    socket.on('new-face-scan', (data) => {
+      setFaceScanAlert(data); setFaceScanVisible(true);
+      if (faceAlertTimer.current) clearTimeout(faceAlertTimer.current);
+      if (data.status === 'RECOGNIZED') { speak('Welcome ' + data.name + ' of flat ' + data.flat + '.'); faceAlertTimer.current = setTimeout(() => setFaceScanVisible(false), 8000); }
+      else { speak('Warning! Stranger detected at the gate. Please verify immediately.'); }
+      loadFaceLogs();
+    });
+    return () => {
+      socket.disconnect(); stopWebcam();
+      if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
+      if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
+      if (faceAlertTimer.current) clearTimeout(faceAlertTimer.current);
+      if (strangerDismissTimer.current) clearTimeout(strangerDismissTimer.current);
+    };
+  }, [startWebcam, stopWebcam]);
+
+  // Auto-scan loop
+  useEffect(() => {
+    if (!webcamReady) return;
+    if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
+    scanIntervalRef.current = setInterval(captureAndScan, 2000);
+    return () => { if (scanIntervalRef.current) clearInterval(scanIntervalRef.current); };
+  }, [webcamReady, captureAndScan]);
+
+  const speak = (text) => {
+    if ('speechSynthesis' in window) { window.speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.rate = 0.95; u.pitch = 1.0; window.speechSynthesis.speak(u); }
   };
 
   const formatPlate = (plate) => {
     if (!plate || plate === 'WAITING...') return plate;
     const clean = plate.toUpperCase().replace(/\s+/g, '');
-    if (clean.length >= 10) {
-      return `${clean.slice(0, 2)} ${clean.slice(2, 4)} ${clean.slice(4, 6)} ${clean.slice(6)}`;
-    }
+    if (clean.length >= 10) return clean.slice(0,2) + ' ' + clean.slice(2,4) + ' ' + clean.slice(4,6) + ' ' + clean.slice(6);
     return clean;
   };
 
   const triggerSimulation = async (plateNum) => {
     try {
-      const res = await fetch('/api/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plate_number: plateNum })
-      });
+      const res = await fetch('/api/simulate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plate_number: plateNum }) });
       const data = await res.json();
       if (!data.success) alert('Simulation error: ' + data.error);
-    } catch (err) {
-      console.error(err);
-    }
+    } catch (err) { console.error(err); }
   };
 
   const triggerCustomSimulation = () => {
     if (!customPlateInput.trim()) return alert('Please enter a plate code');
-    triggerSimulation(customPlateInput.trim());
-    setCustomPlateInput('');
+    triggerSimulation(customPlateInput.trim()); setCustomPlateInput('');
   };
 
   const handleManualOverride = (action) => {
     if (autoCloseTimer.current) clearTimeout(autoCloseTimer.current);
-    if (action === 'OPEN') {
-      setBarrierOpen(true);
-      setGateStateText('Barrier State: OPEN (OVERRIDE)');
-      speak('Manual gate override. Barrier opened.');
-    } else {
-      setBarrierOpen(false);
-      setGateStateText('Barrier State: CLOSED (OVERRIDE)');
-      speak('Manual gate override. Barrier closed.');
-      setScanState('idle');
-    }
+    if (action === 'OPEN') { setBarrierOpen(true); setGateStateText('Barrier State: OPEN (OVERRIDE)'); speak('Manual gate override. Barrier opened.'); }
+    else { setBarrierOpen(false); setGateStateText('Barrier State: CLOSED (OVERRIDE)'); speak('Manual gate override. Barrier closed.'); setScanState('idle'); }
   };
 
   const handleClearLogs = async () => {
-    if (!confirm('Are you sure you want to clear all ANPR history logs?')) return;
-    try {
-      await fetch('/api/logs/clear', { method: 'POST' });
-      loadLogs();
-    } catch (err) {
-      alert('Error: ' + err.message);
-    }
+    if (!confirm('Clear all ANPR history logs?')) return;
+    try { await fetch('/api/logs/clear', { method: 'POST' }); loadLogs(); } catch (err) { alert('Error: ' + err.message); }
   };
 
   const handleClearFaceLogs = async () => {
-    if (!confirm('Are you sure you want to clear all face verification logs?')) return;
-    try {
-      await fetch('/api/face-logs/clear', { method: 'POST' });
-      loadFaceLogs();
-    } catch (err) {
-      alert('Error: ' + err.message);
-    }
+    if (!confirm('Clear all face verification logs?')) return;
+    try { await fetch('/api/face-logs/clear', { method: 'POST' }); loadFaceLogs(); } catch (err) { alert('Error: ' + err.message); }
   };
 
   return (
     <div className="dashboard-grid">
+
+      {/* STRANGER ALERT MODAL */}
+      {strangerAlert && (
+        <div className="stranger-alert-overlay" id="strangerAlertModal" onClick={() => setStrangerAlert(null)}>
+          <div className="stranger-alert-box" onClick={e => e.stopPropagation()}>
+            <div className="stranger-alert-icon"><i className="fa-solid fa-triangle-exclamation"></i></div>
+            <h2 className="stranger-alert-title">UNREGISTERED VEHICLE</h2>
+            <div className="stranger-alert-plate">{formatPlate(strangerAlert.plate)}</div>
+            {strangerAlert.capturedFrame && (
+              <img src={strangerAlert.capturedFrame} className="stranger-alert-capture" alt="Captured frame" />
+            )}
+            <p className="stranger-alert-desc">
+              This vehicle is <strong>NOT registered</strong> in the society database.<br />
+              Please verify the driver before granting entry.
+            </p>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginTop: '16px' }}>
+              <button id="alertGrantEntry" className="btn btn-success" onClick={() => { handleManualOverride('OPEN'); setStrangerAlert(null); }}>
+                <i className="fa-solid fa-door-open"></i> Grant Entry
+              </button>
+              <button id="alertDismiss" className="btn btn-danger" onClick={() => setStrangerAlert(null)}>
+                <i className="fa-solid fa-xmark"></i> Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FACE SCAN TOAST */}
+      {faceScanVisible && faceScanAlert && (
+        <div className={'face-alert-toast ' + (faceScanAlert.status === 'RECOGNIZED' ? 'face-toast-ok' : 'face-toast-danger')}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <strong>{faceScanAlert.status === 'RECOGNIZED' ? '\u2713 Face Verified' : '\u26a0 Stranger Alert'}</strong>
+            <button onClick={() => setFaceScanVisible(false)} style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: '1rem', padding: '0 0 0 12px' }}>&times;</button>
+          </div>
+          <div>{faceScanAlert.name}{faceScanAlert.flat !== '-' ? ' \u2014 Flat ' + faceScanAlert.flat : ''}</div>
+          {faceScanAlert.score > 0 && <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>Confidence: {(faceScanAlert.score * 100).toFixed(1)}%</div>}
+        </div>
+      )}
+
       <div className="dashboard-left">
 
-        {/* Status Indicator Panel */}
-        <div id="statusPanel" className={`glass-panel status-panel state-${scanState}`}>
+        {/* Status Panel */}
+        <div id="statusPanel" className={'glass-panel status-panel state-' + scanState}>
           <div className="status-info">
             <div className="status-badge"></div>
             <div>
               <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Gate Security Status</div>
               <div className="status-text">
-                {scanState === 'idle' && 'Idle - Waiting for Scan'}
-                {scanState === 'granted' && 'ACCESS GRANTED — RESIDENT VEHICLE'}
-                {scanState === 'denied' && 'ACCESS DENIED — UNREGISTERED VEHICLE'}
+                {scanState === 'idle' && 'Idle \u2014 Live ANPR Scanning Active'}
+                {scanState === 'granted' && 'ACCESS GRANTED \u2014 RESIDENT VEHICLE'}
+                {scanState === 'denied' && 'ACCESS DENIED \u2014 UNREGISTERED VEHICLE'}
               </div>
             </div>
           </div>
-          <div className="tts-indicator">
-            <i className="fa-solid fa-volume-high"></i> Voice Guidance Active
-          </div>
+          <div className="tts-indicator"><i className="fa-solid fa-volume-high"></i> Voice Guidance Active</div>
         </div>
 
-        {/* Viewfinder and details */}
+        {/* Viewfinder + Details */}
         <div className="scan-content-grid">
-          <div className="glass-panel gate-view-container">
-            <div className="scan-tag" style={{ backgroundColor: liveStreamActive ? 'rgba(239, 68, 68, 0.85)' : 'rgba(0, 0, 0, 0.7)' }}>
-              <span className="live-dot" style={{ backgroundColor: liveStreamActive ? '#fff' : 'var(--color-danger)' }}></span>
-              <span>{liveStreamActive ? 'LIVE GATE CAMERA FEED' : 'GATE CAMERA STREAM'}</span>
+
+          {/* Live Webcam Viewfinder */}
+          <div className="glass-panel gate-view-container" style={{ position: 'relative', overflow: 'hidden' }}>
+            <div className="scan-tag" style={{ backgroundColor: webcamReady ? 'rgba(239,68,68,0.9)' : 'rgba(0,0,0,0.7)', zIndex: 10 }}>
+              <span className="live-dot" style={{ backgroundColor: webcamReady ? '#fff' : 'var(--color-danger)' }}></span>
+              <span>{webcamReady ? 'LIVE GATE CAM \u00b7 ANPR ACTIVE' : 'CONNECTING CAMERA\u2026'}</span>
             </div>
-            <img src={gatePhoto} className="gate-photo" alt="Gate camera feed" />
-            <div className="scanner-overlay">
-              <div className="scanner-line"></div>
-            </div>
+            {isScanning && (
+              <div className="anpr-scanning-badge">
+                <i className="fa-solid fa-circle-notch fa-spin"></i> SCANNING PLATE&hellip;
+              </div>
+            )}
+            {webcamError ? (
+              <div className="webcam-error-state">
+                <i className="fa-solid fa-camera-slash" style={{ fontSize: '2.5rem', color: 'var(--color-danger)', marginBottom: '12px' }}></i>
+                <p style={{ fontWeight: 600, color: 'white', margin: '0 0 6px' }}>Camera Unavailable</p>
+                <small style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{webcamError}</small>
+                <button className="btn btn-secondary" style={{ marginTop: '14px' }} onClick={startWebcam}>
+                  <i className="fa-solid fa-rotate-right"></i> Retry Camera
+                </button>
+              </div>
+            ) : (
+              <div className="webcam-video-wrapper">
+                <video ref={videoRef} className="gate-webcam-video" autoPlay playsInline muted />
+                <canvas ref={overlayCanvasRef} className="gate-overlay-canvas" />
+                {!webcamReady && (
+                  <div className="webcam-loading-overlay">
+                    <i className="fa-solid fa-circle-notch fa-spin" style={{ fontSize: '2rem', color: 'var(--color-primary)' }}></i>
+                    <span style={{ marginTop: '10px', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Starting camera&hellip;</span>
+                  </div>
+                )}
+              </div>
+            )}
+            <canvas ref={captureCanvasRef} style={{ display: 'none' }} />
+            <div className="scanner-overlay"><div className="scanner-line"></div></div>
           </div>
 
-          {/* Details Card */}
-          <div className="glass-panel details-card">
+          {/* Household Info Panel */}
+          <div className={'glass-panel details-card' + (scanState !== 'idle' ? ' state-' + scanState + '-card' : '')}>
             <div>
               <div className="details-header">
                 <img src={resident.photo_url} className="resident-avatar" alt="Profile" />
                 <div className="resident-title">
                   <h3>{resident.name}</h3>
-                  <p>Flat Number: {resident.flat}</p>
+                  <p>Flat: <strong>{resident.flat}</strong></p>
                 </div>
               </div>
-
               <div className="info-rows">
-                <div className="info-row">
-                  <span className="info-label">Contact:</span>
-                  <span className="info-value">{resident.contact}</span>
-                </div>
-                <div className="info-row">
-                  <span className="info-label">Vehicle Type:</span>
-                  <span className="info-value">{resident.model}</span>
-                </div>
-                <div className="info-row">
-                  <span className="info-label">Color:</span>
-                  <span className="info-value">{resident.color}</span>
-                </div>
+                <div className="info-row"><span className="info-label">Contact:</span><span className="info-value">{resident.contact}</span></div>
+                <div className="info-row"><span className="info-label">Vehicle:</span><span className="info-value">{resident.model}</span></div>
+                <div className="info-row"><span className="info-label">Color:</span><span className="info-value">{resident.color}</span></div>
               </div>
             </div>
 
+            {resident.family_members && resident.family_members.length > 0 && (
+              <div className="household-members-section">
+                <div className="household-members-title">
+                  <i className="fa-solid fa-users"></i> Household Members ({resident.family_members.length})
+                </div>
+                <div className="household-members-grid">
+                  {resident.family_members.map((m, idx) => (
+                    <div key={m.id || idx} className="household-member-chip">
+                      <img src={m.photo_url || '/static/images/unknown_avatar.svg'} alt={m.name} className="household-member-photo" />
+                      <div className="household-member-info">
+                        <div className="household-member-name">{m.name}</div>
+                        <div className="household-member-phone"><i className="fa-solid fa-phone" style={{ fontSize: '0.65rem' }}></i> {m.phone}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="plate-badge-container">
-              <div className="plate-badge-large">{formatPlate(plateText)}</div>
+              <div className={'plate-badge-large' + (scanState === 'granted' ? ' plate-granted' : scanState === 'denied' ? ' plate-denied' : '')}>
+                {formatPlate(plateText)}
+              </div>
             </div>
           </div>
         </div>
@@ -363,46 +509,23 @@ function GuardDashboard() {
           </div>
           <div className="logs-table-container">
             <table className="logs-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Plate Number</th>
-                  <th>Resident Name</th>
-                  <th>Flat</th>
-                  <th>Status</th>
-                  <th>Gate Photo</th>
-                </tr>
-              </thead>
+              <thead><tr><th>Time</th><th>Plate Number</th><th>Resident Name</th><th>Flat</th><th>Status</th><th>Gate Photo</th></tr></thead>
               <tbody>
                 {logs.length === 0 ? (
-                  <tr>
-                    <td colSpan="6" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '30px' }}>No entries logged yet. Try scanning a vehicle.</td>
-                  </tr>
-                ) : (
-                  logs.map((log) => {
-                    const date = new Date(log.timestamp);
-                    const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                    const isGranted = log.status === 'GRANTED';
-                    return (
-                      <tr key={log.id}>
-                        <td><strong style={{ color: 'var(--text-primary)' }}>{timeStr}</strong></td>
-                        <td><span className="plate-badge-small">{log.plate_number}</span></td>
-                        <td>{log.resident_name}</td>
-                        <td>{log.flat_number}</td>
-                        <td>
-                          <span className={`badge-status ${isGranted ? 'granted' : 'denied'}`}>
-                            <i className={`fa-solid ${isGranted ? 'fa-circle-check' : 'fa-circle-xmark'}`}></i> {log.status}
-                          </span>
-                        </td>
-                        <td>
-                          <a href={log.photo_path} target="_blank" rel="noreferrer" style={{ color: 'var(--color-primary)', fontSize: '0.85rem', textDecoration: 'none', fontWeight: 'bold', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                            <i className="fa-regular fa-image"></i> View Photo
-                          </a>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
+                  <tr><td colSpan="6" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '30px' }}>No entries logged yet. Point the webcam at a vehicle plate.</td></tr>
+                ) : logs.map((log) => {
+                  const timeStr = new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                  const isGranted = log.status === 'GRANTED';
+                  return (
+                    <tr key={log.id}>
+                      <td><strong style={{ color: 'var(--text-primary)' }}>{timeStr}</strong></td>
+                      <td><span className="plate-badge-small">{log.plate_number}</span></td>
+                      <td>{log.resident_name}</td><td>{log.flat_number}</td>
+                      <td><span className={'badge-status ' + (isGranted ? 'granted' : 'denied')}><i className={'fa-solid ' + (isGranted ? 'fa-circle-check' : 'fa-circle-xmark')}></i> {log.status}</span></td>
+                      <td><a href={log.photo_path} target="_blank" rel="noreferrer" style={{ color: 'var(--color-primary)', fontSize: '0.85rem', textDecoration: 'none', fontWeight: 'bold', display: 'inline-flex', alignItems: 'center', gap: '4px' }}><i className="fa-regular fa-image"></i> View</a></td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -416,76 +539,74 @@ function GuardDashboard() {
           </div>
           <div className="logs-table-container">
             <table className="logs-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Name</th>
-                  <th>Flat</th>
-                  <th>Status</th>
-                  <th>Confidence</th>
-                  <th>Live Photo</th>
-                </tr>
-              </thead>
+              <thead><tr><th>Time</th><th>Name</th><th>Flat</th><th>Status</th><th>Confidence</th><th>Live Photo</th></tr></thead>
               <tbody>
                 {faceLogs.length === 0 ? (
-                  <tr>
-                    <td colSpan="6" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '30px' }}>No face scans logged yet.</td>
-                  </tr>
-                ) : (
-                  faceLogs.map((log) => {
-                    const date = new Date(log.timestamp);
-                    const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                    const isRecognized = log.status === 'RECOGNIZED';
-                    return (
-                      <tr key={log.id}>
-                        <td><strong style={{ color: 'var(--text-primary)' }}>{timeStr}</strong></td>
-                        <td>{log.name}</td>
-                        <td>{log.flat_number}</td>
-                        <td>
-                          <span className={`badge-status ${isRecognized ? 'granted' : 'denied'}`}>
-                            <i className={`fa-solid ${isRecognized ? 'fa-circle-check' : 'fa-triangle-exclamation'}`}></i>
-                            {isRecognized ? ' RECOGNIZED' : ' STRANGER'}
-                          </span>
-                        </td>
-                        <td style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
-                          {isRecognized ? `${(log.score * 100).toFixed(1)}%` : '—'}
-                        </td>
-                        <td>
-                          <a href={log.photo_path} target="_blank" rel="noreferrer" style={{ color: 'var(--color-primary)', fontSize: '0.85rem', textDecoration: 'none', fontWeight: 'bold', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                            <i className="fa-regular fa-image"></i> View
-                          </a>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
+                  <tr><td colSpan="6" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '30px' }}>No face scans logged yet.</td></tr>
+                ) : faceLogs.map((log) => {
+                  const timeStr = new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                  const isRecognized = log.status === 'RECOGNIZED';
+                  return (
+                    <tr key={log.id}>
+                      <td><strong style={{ color: 'var(--text-primary)' }}>{timeStr}</strong></td>
+                      <td>{log.name}</td><td>{log.flat_number}</td>
+                      <td><span className={'badge-status ' + (isRecognized ? 'granted' : 'denied')}><i className={'fa-solid ' + (isRecognized ? 'fa-circle-check' : 'fa-triangle-exclamation')}></i>{isRecognized ? ' RECOGNIZED' : ' STRANGER'}</span></td>
+                      <td style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>{isRecognized ? (log.score * 100).toFixed(1) + '%' : '\u2014'}</td>
+                      <td><a href={log.photo_path} target="_blank" rel="noreferrer" style={{ color: 'var(--color-primary)', fontSize: '0.85rem', textDecoration: 'none', fontWeight: 'bold', display: 'inline-flex', alignItems: 'center', gap: '4px' }}><i className="fa-regular fa-image"></i> View</a></td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         </div>
       </div>
 
-      {/* Right Column: Boom Barrier & Simulator */}
+      {/* Right Column */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '30px' }}>
         <div className="glass-panel barrier-panel">
           <h3><i className="fa-solid fa-road-barrier"></i> Boom Barrier Gate</h3>
           <div className="barrier-graphic-container">
             <div className="barrier-stand"></div>
-            <div id="barrierArm" className={`barrier-arm ${barrierOpen ? 'open' : ''}`}></div>
+            <div id="barrierArm" className={'barrier-arm ' + (barrierOpen ? 'open' : '')}></div>
           </div>
-          <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginTop: '15px', fontWeight: 'bold', textTransform: 'uppercase' }}>
-            {gateStateText}
-          </div>
+          <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginTop: '15px', fontWeight: 'bold', textTransform: 'uppercase' }}>{gateStateText}</div>
           <div className="barrier-controls">
             <button className="btn btn-success" onClick={() => handleManualOverride('OPEN')}><i className="fa-solid fa-arrow-up"></i> Manual Open</button>
             <button className="btn btn-danger" onClick={() => handleManualOverride('CLOSE')}><i className="fa-solid fa-arrow-down"></i> Manual Close</button>
           </div>
         </div>
 
-        {/* Simulator controls */}
+        {/* Live ANPR Status Card */}
+        <div className="glass-panel" style={{ padding: '20px' }}>
+          <h3 style={{ marginBottom: '14px', fontSize: '1rem' }}><i className="fa-solid fa-camera-rotate"></i> Live ANPR Status</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '0.85rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>Camera</span>
+              <span style={{ color: webcamReady ? 'var(--color-success)' : webcamError ? 'var(--color-danger)' : 'var(--color-warning)', fontWeight: 600 }}>
+                {webcamReady ? '\u25cf LIVE' : webcamError ? '\u2715 ERROR' : '\u25cc Connecting'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>Scan Interval</span>
+              <span style={{ fontFamily: 'monospace' }}>every 2s</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>Last Plate</span>
+              <span style={{ fontFamily: 'monospace', color: 'var(--color-primary)', fontSize: '0.8rem' }}>{lastDetectedPlate || '\u2014'}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>Debounce</span>
+              <span style={{ fontFamily: 'monospace', color: 'var(--text-muted)' }}>60s / plate</span>
+            </div>
+            {isScanning && <div style={{ textAlign: 'center', color: 'var(--color-primary)', fontWeight: 600 }}><i className="fa-solid fa-circle-notch fa-spin"></i> Scanning&hellip;</div>}
+          </div>
+        </div>
+
+        {/* Simulator */}
         <div className="glass-panel" style={{ padding: '24px' }}>
-          <h3 style={{ marginBottom: '15px' }}><i className="fa-solid fa-vial"></i> Gate Camera Simulator</h3>
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '20px' }}>Use these quick triggers to simulate plate reads directly without phone upload.</p>
+          <h3 style={{ marginBottom: '15px' }}><i className="fa-solid fa-vial"></i> Gate Simulator</h3>
+          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '20px' }}>Quick triggers to test without camera.</p>
           <div className="sim-controls">
             <div className="sim-button-grid">
               <button className="btn btn-secondary" onClick={() => triggerSimulation('MH12AB1234')}>MH12AB1234<br /><span style={{ fontSize: '0.7rem', opacity: 0.7 }}>(Ishani Flat 420)</span></button>
@@ -501,9 +622,8 @@ function GuardDashboard() {
               </button>
               <button className="btn btn-danger" onClick={() => triggerSimulation('KA03HA9999')} style={{ gridColumn: 'span 2' }}>Simulate Unregistered Plate (KA03HA9999)</button>
             </div>
-
             <div className="sim-input-group">
-              <label htmlFor="customPlate">Or input a custom plate code:</label>
+              <label htmlFor="customPlate">Custom plate code:</label>
               <div style={{ display: 'flex', gap: '8px' }}>
                 <input type="text" id="customPlate" className="text-input" placeholder="e.g. MH12XX9999" style={{ flex: 1, textTransform: 'uppercase' }} value={customPlateInput} onChange={(e) => setCustomPlateInput(e.target.value)} />
                 <button className="btn btn-primary" onClick={triggerCustomSimulation} style={{ flex: '0 0 auto' }}>Scan</button>

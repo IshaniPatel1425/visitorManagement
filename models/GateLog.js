@@ -20,6 +20,12 @@ const GateLogSchema = new mongoose.Schema({
   photoPath: {
     type: String,
   },
+  // Snapshot of all household members at time of scan (for audit history)
+  familySnapshot: [{
+    name: String,
+    phone: String,
+    photo_url: String,
+  }],
   timestamp: {
     type: Date,
     default: Date.now,
